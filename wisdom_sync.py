@@ -141,28 +141,46 @@ class WisdomClient:
         # Step 1: Load the login page to get initial cookies
         resp = self.session.get(WISDOM_LOGIN, timeout=30)
         resp.raise_for_status()
+        log.info(f"Login page status: {resp.status_code}, url: {resp.url}")
         log.info(f"Login page cookies: {list(self.session.cookies.keys())}")
 
-        # Step 2: Submit login credentials
+        # Step 2: Submit login credentials - track ALL redirects
         login_payload = {
             "sap-user":   WISDOM_EMAIL,
             "sap-passwd": WISDOM_PASSWORD,
         }
+
+        # First try WITHOUT following redirects to see where it sends us
         login_resp = self.session.post(
             WISDOM_LOGIN,
             data=login_payload,
             timeout=30,
-            allow_redirects=True
+            allow_redirects=False
         )
-        log.info(f"Post-login cookies: {list(self.session.cookies.keys())}")
+        log.info(f"Login POST status: {login_resp.status_code}")
+        log.info(f"Login POST location: {login_resp.headers.get('Location', 'none')}")
+        log.info(f"Login POST cookies set: {list(login_resp.cookies.keys())}")
 
-        # Step 3: Force ALL cookies to path=/ so they are sent to /WISDOM_DATA
-        # SAP sets cookies with restrictive paths (/WIS) which blocks them from
-        # reaching the OData API at /WISDOM_DATA
+        # Follow redirects manually to capture all intermediate cookies
+        redirect_url = login_resp.headers.get("Location")
+        hop = 0
+        while redirect_url and hop < 10:
+            hop += 1
+            if not redirect_url.startswith("http"):
+                redirect_url = f"{WISDOM_BASE}{redirect_url}"
+            log.info(f"Following redirect {hop}: {redirect_url}")
+            r = self.session.get(redirect_url, timeout=30, allow_redirects=False)
+            log.info(f"  Status: {r.status_code}, cookies: {list(r.cookies.keys())}")
+            log.info(f"  All session cookies now: {list(self.session.cookies.keys())}")
+            redirect_url = r.headers.get("Location")
+
+        log.info(f"Final cookies: {list(self.session.cookies.keys())}")
+
+        # Step 3: Force ALL cookies to path=/
         all_cookies = {}
         for cookie in self.session.cookies:
             all_cookies[cookie.name] = cookie.value
-            log.info(f"Cookie: {cookie.name} path={cookie.path}")
+            log.info(f"Cookie: {cookie.name} = {cookie.value[:20]}... path={cookie.path}")
 
         self.session.cookies.clear()
         for name, value in all_cookies.items():
@@ -171,9 +189,8 @@ class WisdomClient:
                 domain="wisdom.jdwetherspoon.co.uk",
                 path="/"
             )
-        log.info(f"Normalised {len(all_cookies)} cookies to path=/")
 
-        # Step 4: Fetch CSRF token from a known job endpoint
+        # Step 4: Fetch CSRF token
         csrf_resp = self.session.get(
             f"{WISDOM_DATA}/JobSet('10002107640')",
             headers={"X-Csrf-Token": "Fetch"},
@@ -184,12 +201,14 @@ class WisdomClient:
             self.session.headers["X-Csrf-Token"] = fetched_csrf
             log.info(f"CSRF token acquired.")
 
-        # Step 5: Validate by fetching a known job
+        # Step 5: Validate
         test = self.session.get(
             f"{WISDOM_DATA}/JobSet('10002107640')",
             timeout=30
         )
-        log.info(f"Validation status: {test.status_code}, length: {len(test.text)}")
+        log.info(f"Validation: {test.status_code}, length: {len(test.text)}")
+        log.info(f"Validation preview: {test.text[:200]}")
+
         if test.status_code == 200:
             try:
                 data = test.json()
@@ -197,10 +216,9 @@ class WisdomClient:
                     self.authenticated = True
                     log.info("Authentication successful.")
                 else:
-                    log.error(f"Auth response body: {test.text[:300]}")
-                    raise RuntimeError("Got 200 but no job data - session not authenticated.")
+                    raise RuntimeError("Got 200 but no job data.")
             except Exception as e:
-                log.error(f"Auth parse error: {e}, body: {test.text[:300]}")
+                log.error(f"Parse error: {e}")
                 raise
         else:
             raise RuntimeError(f"Authentication failed. Status: {test.status_code}")
