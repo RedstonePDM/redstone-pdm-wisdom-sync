@@ -158,12 +158,12 @@ class WisdomClient:
             page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
             log.info("Login page loaded.")
 
-            # Fill in credentials using exact field IDs from Wisdom login page
-            page.fill("#sap-alias", WISDOM_EMAIL)
-            page.fill("#sap-password", WISDOM_PASSWORD)
+            # Fill in credentials
+            page.fill("input[name='sap-user'], #USERNAME, input[type='text']", WISDOM_EMAIL)
+            page.fill("input[name='sap-passwd'], #PASSWORD, input[type='password']", WISDOM_PASSWORD)
 
             # Click login button
-            page.click("#submitBtn")
+            page.click("input[type='submit'], button[type='submit'], .loginButton, #LOGIN_LINK")
 
             # Wait for navigation to complete
             page.wait_for_load_state("networkidle", timeout=60000)
@@ -267,6 +267,30 @@ class WisdomClient:
         resp.raise_for_status()
         return resp.json().get("d", {})
 
+    def get_pub_postcode(self, pub_id):
+        """
+        Fetch pub details to get postcode from address.
+        Pub ID extracted from Location field e.g. JDW-5779-22 -> 5779
+        READ-ONLY: GET request only.
+        """
+        import re
+        uk_postcode = re.compile(r"[A-Z]{1,2}[0-9][0-9A-Z]?[ ]*[0-9][A-Z]{2}")
+        try:
+            url = f"{WISDOM_DATA}/PubSet('{pub_id}')"
+            resp = self.session.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json().get("d", {})
+                # Check all address fields for postcode
+                for field in ["PostCode", "Address1", "Address2", "Address3", "Address"]:
+                    val = (data.get(field) or "").upper().strip()
+                    if val:
+                        match = uk_postcode.search(val)
+                        if match:
+                            return match.group(0).strip()
+        except Exception as e:
+            log.debug(f"Pub postcode lookup failed for {pub_id}: {e}")
+        return ""
+
 
 # ── Sync Logic ────────────────────────────────────────────────────────────────
 
@@ -281,7 +305,8 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
     description = fixed_description or job_data.get("Description", "").strip()
 
     # Extract postcode from location data if available
-    postcode = job_data.get("PostCode", "") or ""
+    # Extract postcode - passed in via job_data if available
+    postcode = job_data.get("PostCode", "") or job_data.get("_postcode", "") or ""
 
     now = datetime.now(timezone.utc)
 
@@ -363,6 +388,7 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
 
     jobs_found = jobs_new = jobs_updated = 0
     skip = 0
+    pub_postcode_cache = {}
 
     try:
         while True:
@@ -381,11 +407,24 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
                 # Fetch full detail for each job (gets description etc.)
                 try:
                     if fixed_desc:
-                        # MIV - use summary data, fixed description
                         job_detail = job_summary
                     else:
                         job_detail = client.get_job_detail(job_id)
-                        time.sleep(0.2)  # Be polite to the server
+                        time.sleep(0.2)
+
+                    # Extract postcode from pub location
+                    if not job_detail.get("PostCode"):
+                        location = job_detail.get("Location", "")
+                        parts = location.split("-") if location else []
+                        if len(parts) >= 2:
+                            pub_id = parts[1]
+                            postcode = pub_postcode_cache.get(pub_id)
+                            if postcode is None:
+                                postcode = client.get_pub_postcode(pub_id)
+                                pub_postcode_cache[pub_id] = postcode
+                                time.sleep(0.1)
+                            job_detail["_postcode"] = postcode
+
                 except Exception as e:
                     log.warning(f"Could not fetch detail for job {job_id}: {e}")
                     job_detail = job_summary
