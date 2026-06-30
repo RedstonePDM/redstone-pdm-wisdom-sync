@@ -275,62 +275,48 @@ class WisdomClient:
 
     def get_pub_postcode(self, pub_id):
         """
-        Fetch pub postcode directly from PubSet API.
-        Pub ID extracted from Location field e.g. JDW-5779-22 -> 5779
+        Fetch pub postcode from PubSet API.
+        Wisdom returns the address as a single string e.g. '25 High Street OX14 5AA Abingdon'
+        so we extract the UK postcode via regex from any string field.
         READ-ONLY: GET request only.
-
-        Logs all field names returned on first call to help identify
-        the correct postcode field name if PostCode doesn't match.
         """
+        uk_postcode_re = re.compile(
+            r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s+\d[A-Z]{2})\b', re.I
+        )
         try:
             url = f"{WISDOM_DATA}/PubSet('{pub_id}')"
             resp = self.session.get(url, timeout=15)
             if resp.status_code == 200:
                 data = resp.json().get("d", {})
+                log.info(f"PubSet({pub_id}) string fields: { {k: v for k, v in data.items() if isinstance(v, str) and v} }")
 
-                # Log all field names so we can identify the correct postcode field
-                log.info(f"PubSet({pub_id}) fields returned: {list(data.keys())}")
-
-                # Try all likely postcode field name variants
+                # First try dedicated postcode fields
                 postcode = (
-                    data.get("PostCode")
-                    or data.get("Postcode")
-                    or data.get("PostalCode")
-                    or data.get("ZipCode")
-                    or data.get("ZIPCode")
-                    or data.get("SitePostCode")
-                    or data.get("PubPostCode")
-                    or ""
-                )
+                    data.get("PostCode", "") or data.get("Postcode", "") or data.get("PostalCode", "") or ""
+                ).strip()
 
-                # If still nothing, scan all string values for a UK postcode pattern
+                # If no dedicated field, scan every string field for a UK postcode pattern
+                # Covers Address = '25 High Street OX14 5AA Abingdon'
                 if not postcode:
-                    uk_postcode_re = re.compile(
-                        r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.I
-                    )
                     for key, val in data.items():
                         if isinstance(val, str):
                             match = uk_postcode_re.search(val)
                             if match:
                                 postcode = match.group(1).strip()
-                                log.info(f"PubSet({pub_id}): postcode found in field '{key}': {postcode}")
+                                log.info(f"PubSet({pub_id}): postcode '{postcode}' extracted from field '{key}': {val}")
                                 break
 
                 if postcode:
-                    log.info(f"PubSet({pub_id}): postcode = {postcode.strip()}")
+                    log.info(f"PubSet({pub_id}): final postcode = {postcode}")
                 else:
-                    log.warning(f"PubSet({pub_id}): no postcode found in any field")
+                    log.warning(f"PubSet({pub_id}): no postcode found. Full response: {data}")
 
-                return postcode.strip()
+                return postcode
             else:
-                log.warning(f"PubSet({pub_id}): HTTP {resp.status_code}")
+                log.warning(f"PubSet({pub_id}): HTTP {resp.status_code} - {resp.text[:200]}")
         except Exception as e:
-            log.warning(f"Pub postcode lookup failed for {pub_id}: {e}")
+            log.warning(f"Pub postcode lookup failed for pub_id={pub_id}: {e}")
         return ""
-
-
-# ── Sync Logic ────────────────────────────────────────────────────────────────
-
 def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
                tab_label: str, fixed_description: str | None):
     """Insert or update a job record in the database."""
