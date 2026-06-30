@@ -165,6 +165,12 @@ class WisdomClient:
             page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
             log.info("Login page loaded.")
 
+            # DEBUG - log page details so we can identify the correct input selectors
+            log.info(f"Page URL after load: {page.url}")
+            log.info(f"Page title: {page.title()}")
+            html = page.content()
+            log.info(f"Page HTML (first 3000 chars):\n{html[:3000]}")
+
             # Fill in credentials
             page.fill("input[name='sap-user'], #USERNAME, input[type='text']", WISDOM_EMAIL)
             page.fill("input[name='sap-passwd'], #PASSWORD, input[type='password']", WISDOM_PASSWORD)
