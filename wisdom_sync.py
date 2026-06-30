@@ -434,14 +434,24 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
 
                     # Extract postcode from pub location for ALL job types including MIV
                     if not job_detail.get("PostCode") and not job_detail.get("_postcode"):
-                        location = (
-                            job_detail.get("Location", "")
-                            or job_detail.get("LocationCode", "")
-                            or job_summary.get("Location", "")
+                        # Try PubId directly first (MIV jobs have this but no Location code)
+                        pub_id = (
+                            job_detail.get("PubId")
+                            or job_summary.get("PubId")
+                            or ""
                         )
-                        parts = location.split("-") if location else []
-                        if len(parts) >= 2:
-                            pub_id = parts[1]
+                        # Fall back to parsing from location code e.g. JDW-5779-22 -> 5779
+                        if not pub_id:
+                            location = (
+                                job_detail.get("Location", "")
+                                or job_detail.get("LocationCode", "")
+                                or job_summary.get("Location", "")
+                            )
+                            parts = location.split("-") if location else []
+                            if len(parts) >= 2:
+                                pub_id = parts[1]
+
+                        if pub_id:
                             if pub_id not in pub_postcode_cache:
                                 postcode = client.get_pub_postcode(pub_id)
                                 pub_postcode_cache[pub_id] = postcode
@@ -452,7 +462,7 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
                                 job_detail["_postcode"] = postcode
                                 log.info(f"Job {job_id}: postcode set to {postcode} from pub {pub_id}")
                         else:
-                            log.debug(f"Job {job_id}: no location code found for postcode lookup (location={location!r})")
+                            log.debug(f"Job {job_id}: no pub ID found for postcode lookup")
 
                 except Exception as e:
                     log.warning(f"Could not fetch detail for job {job_id}: {e}")
@@ -512,22 +522,34 @@ def backfill_postcodes(client, conn, cur):
 
     log.info(f"Postcode backfill: {count} jobs missing postcodes. Fetching...")
 
+    # Get distinct pub IDs for jobs missing postcodes
+    # MIV jobs have PubId in raw_json but no location_code, so check both
     dict_cur.execute("""
-        SELECT DISTINCT location_code FROM jobs
+        SELECT DISTINCT
+            CASE
+                WHEN location_code IS NOT NULL AND location_code != ''
+                    THEN split_part(location_code, '-', 2)
+                ELSE raw_json->>'PubId'
+            END as pub_id,
+            job_id
+        FROM jobs
         WHERE (postcode IS NULL OR postcode = '')
-        AND location_code IS NOT NULL AND location_code != ''
+        AND (
+            (location_code IS NOT NULL AND location_code != '')
+            OR (raw_json->>'PubId' IS NOT NULL AND raw_json->>'PubId' != '')
+        )
     """)
-    locations = [r["location_code"] for r in dict_cur.fetchall()]
+    rows = dict_cur.fetchall()
     dict_cur.close()
 
     pub_cache = {}
     updated = 0
 
-    for location in locations:
-        parts = location.split("-") if location else []
-        if len(parts) < 2:
+    for row in rows:
+        pub_id = row["pub_id"]
+        job_id = row["job_id"]
+        if not pub_id:
             continue
-        pub_id = parts[1]
 
         if pub_id not in pub_cache:
             postcode = client.get_pub_postcode(pub_id)
@@ -539,9 +561,9 @@ def backfill_postcodes(client, conn, cur):
         if postcode:
             cur.execute("""
                 UPDATE jobs SET postcode = %s
-                WHERE location_code = %s
+                WHERE job_id = %s
                 AND (postcode IS NULL OR postcode = '')
-            """, (postcode, location))
+            """, (postcode, job_id))
             updated += cur.rowcount
 
     conn.commit()
