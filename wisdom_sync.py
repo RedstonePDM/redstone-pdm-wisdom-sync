@@ -453,6 +453,47 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
         log.error(f"  ✗ {label}: {e}")
 
 
+def backfill_postcodes(client, conn, cur):
+    """One-time backfill: fetch postcodes for all jobs that are missing them."""
+    cur.execute("SELECT COUNT(*) as c FROM jobs WHERE postcode IS NULL OR postcode = ''")
+    count = cur.fetchone()["c"]
+    if count == 0:
+        log.info("Postcode backfill: all jobs already have postcodes.")
+        return
+
+    log.info(f"Postcode backfill: {count} jobs missing postcodes. Fetching...")
+    cur.execute("""
+        SELECT DISTINCT location_code FROM jobs
+        WHERE (postcode IS NULL OR postcode = '')
+        AND location_code IS NOT NULL AND location_code != ''
+    """)
+    locations = [r["location_code"] for r in cur.fetchall()]
+
+    pub_cache = {}
+    updated = 0
+    for location in locations:
+        parts = location.split("-") if location else []
+        if len(parts) < 2:
+            continue
+        pub_id = parts[1]
+        if pub_id not in pub_cache:
+            postcode = client.get_pub_postcode(pub_id)
+            pub_cache[pub_id] = postcode
+            time.sleep(0.15)
+        else:
+            postcode = pub_cache[pub_id]
+
+        if postcode:
+            cur.execute("""
+                UPDATE jobs SET postcode = %s
+                WHERE location_code = %s AND (postcode IS NULL OR postcode = '')
+            """, (postcode, location))
+            updated += cur.rowcount
+
+    conn.commit()
+    log.info(f"Postcode backfill complete: updated {updated} jobs across {len(pub_cache)} pubs.")
+
+
 def run_sync():
     """Run a full sync cycle across all targets."""
     log.info("=" * 60)
@@ -464,6 +505,12 @@ def run_sync():
 
     conn = get_db()
     cur = conn.cursor()
+
+    # Backfill postcodes for any jobs missing them
+    try:
+        backfill_postcodes(client, conn, cur)
+    except Exception as e:
+        log.error(f"Postcode backfill failed: {e}")
 
     for target in EXTRACTION_TARGETS:
         sync_target(client, target, conn, cur)
