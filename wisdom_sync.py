@@ -183,9 +183,13 @@ class WisdomClient:
                 log.info(f"  Cookie: {c['name']} path={c['path']}")
 
             # Get CSRF token from page context if available
-            csrf = page.evaluate("() => { try { return angular.element(document.body).injector().get('$http').defaults.headers.common['X-Csrf-Token']; } catch(e) { return null; } }")
-            if csrf:
-                log.info(f"CSRF from Angular context: {csrf[:20]}...")
+            # Try to get CSRF from Angular context - may fail if page has navigated, that's OK
+            try:
+                csrf = page.evaluate("() => { try { return angular.element(document.body).injector().get('$http').defaults.headers.common['X-Csrf-Token']; } catch(e) { return null; } }")
+                if csrf:
+                    log.info(f"CSRF from Angular context: {csrf[:20]}...")
+            except Exception as e:
+                log.info(f"Angular CSRF extract skipped (page navigated): {e}")
 
             browser.close()
 
