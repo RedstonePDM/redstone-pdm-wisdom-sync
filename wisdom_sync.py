@@ -167,7 +167,7 @@ class WisdomClient:
 
             # Fill in credentials using confirmed Wisdom field names from page HTML
             page.fill("input[name='sap-alias']", WISDOM_EMAIL)
-            page.fill("input[name='sap-system-login-password']", WISDOM_PASSWORD)
+            page.fill("input[name='sap-password']", WISDOM_PASSWORD)
 
             # Submit using the SAP login function via JavaScript
             page.evaluate("callSubmitLogin('onLogin')")
