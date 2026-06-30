@@ -126,7 +126,11 @@ class WisdomClient:
             "Accept-Encoding":  "gzip, deflate, br",
             "Accept-Language":  "en-GB,en-US;q=0.9,en;q=0.8",
             "X-Requested-With": "XMLHttpRequest",
-            "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/149.0.0.0 Safari/537.36",
+            "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            "Referer":          WISDOM_LOGIN,
+            "Sec-Fetch-Dest":   "empty",
+            "Sec-Fetch-Mode":   "cors",
+            "Sec-Fetch-Site":   "same-origin",
         })
         self.authenticated = False
 
@@ -200,7 +204,11 @@ class WisdomClient:
             f"/BusinessObject"
             f"?$skip={skip}&$top={top}&$inlinecount=allpages"
         )
+        log.info(f"Fetching: {url}")
         resp = self.session.get(url, timeout=30)
+        log.info(f"Status: {resp.status_code}, Length: {len(resp.text)}")
+        if resp.text:
+            log.info(f"Preview: {resp.text[:300]}")
         resp.raise_for_status()
         data = resp.json()
         results = data.get("d", {}).get("results", [])
