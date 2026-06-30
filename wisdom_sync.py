@@ -150,67 +150,66 @@ class WisdomClient:
         context. API responses are returned as JSON text and parsed in Python.
         READ-ONLY: we only navigate and fetch data, never submit or modify anything.
         """
+        import json as _json
         log.info("Authenticating with Wisdom via browser...")
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
+        # Start Playwright without context manager so it stays alive for all API calls
+        self._playwright = sync_playwright().start()
+        browser = self._playwright.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
 
-            # Navigate to login page
-            log.info(f"Navigating to: {WISDOM_LOGIN}")
-            page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
-            log.info("Login page loaded.")
+        # Navigate to login page
+        log.info(f"Navigating to: {WISDOM_LOGIN}")
+        page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
+        log.info("Login page loaded.")
 
-            # Fill in credentials using confirmed Wisdom field names
-            page.fill("input[name='sap-alias']", WISDOM_EMAIL)
-            page.fill("input[name='sap-password']", WISDOM_PASSWORD)
-            page.evaluate("callSubmitLogin('onLogin')")
+        # Fill in credentials using confirmed Wisdom field names
+        page.fill("input[name='sap-alias']", WISDOM_EMAIL)
+        page.fill("input[name='sap-password']", WISDOM_PASSWORD)
+        page.evaluate("callSubmitLogin('onLogin')")
 
-            # Wait for the post-login page to fully load and settle
-            page.wait_for_load_state("networkidle", timeout=60000)
-            # Extra wait to ensure any post-login redirects complete
-            page.wait_for_timeout(2000)
-            page.wait_for_load_state("networkidle", timeout=30000)
-            log.info(f"Post-login URL: {page.url}")
+        # Wait for the post-login page to fully load and settle
+        page.wait_for_load_state("networkidle", timeout=60000)
+        page.wait_for_timeout(2000)
+        page.wait_for_load_state("networkidle", timeout=30000)
+        log.info(f"Post-login URL: {page.url}")
 
-            # Validate session by fetching a known job via the browser context
-            log.info("Validating session via browser fetch...")
-            result = page.evaluate("""
-                async () => {
-                    const resp = await fetch("https://wisdom.jdwetherspoon.co.uk/WISDOM_DATA/JobSet('10002107640')", {
-                        headers: {
-                            "Accept": "application/json",
-                            "X-Requested-With": "XMLHttpRequest"
-                        }
-                    });
-                    return { status: resp.status, text: await resp.text() };
-                }
-            """)
-            log.info(f"Validation fetch: status={result['status']}, length={len(result['text'])}")
-            log.info(f"Validation preview: {result['text'][:300]}")
+        # Validate session by fetching a known job via the browser context
+        log.info("Validating session via browser fetch...")
+        result = page.evaluate("""
+            async () => {
+                const resp = await fetch("https://wisdom.jdwetherspoon.co.uk/WISDOM_DATA/JobSet('10002107640')", {
+                    headers: {
+                        "Accept": "application/json",
+                        "X-Requested-With": "XMLHttpRequest"
+                    }
+                });
+                return { status: resp.status, text: await resp.text() };
+            }
+        """)
+        log.info(f"Validation fetch: status={result['status']}, length={len(result['text'])}")
+        log.info(f"Validation preview: {result['text'][:300]}")
 
-            if result["status"] != 200:
-                raise RuntimeError(f"Browser fetch validation failed: HTTP {result['status']}")
+        if result["status"] != 200:
+            raise RuntimeError(f"Browser fetch validation failed: HTTP {result['status']}")
 
-            import json as _json
-            try:
-                data = _json.loads(result["text"])
-                if not data.get("d", {}).get("JobId"):
-                    raise RuntimeError("Validation response has no JobId")
-                log.info("Browser session validated successfully.")
-            except Exception as e:
-                raise RuntimeError(f"Validation parse error: {e}, body: {result['text'][:300]}")
+        try:
+            data = _json.loads(result["text"])
+            if not data.get("d", {}).get("JobId"):
+                raise RuntimeError("Validation response has no JobId")
+            log.info("Browser session validated successfully.")
+        except Exception as e:
+            raise RuntimeError(f"Validation parse error: {e}, body: {result['text'][:300]}")
 
-            # Store the browser context for all subsequent API calls
-            self._playwright = p
-            self._browser = browser
-            self._context = context
-            self._page = page
-            self.authenticated = True
-            log.info("Authentication successful. Using browser context for all API calls.")
+        # Store browser page for all subsequent API calls
+        self._browser = browser
+        self._context = context
+        self._page = page
+        self.authenticated = True
+        log.info("Authentication successful. Browser stays open for all API calls.")
 
     def _extract_csrf(self, response):
         """Try to extract CSRF token from response headers or HTML."""
@@ -568,9 +567,10 @@ def run_sync():
     cur.close()
     conn.close()
 
-    # Close the browser after all syncs complete
+    # Close the browser and stop Playwright after all syncs complete
     try:
         client._browser.close()
+        client._playwright.stop()
         log.info("Browser closed.")
     except Exception:
         pass
