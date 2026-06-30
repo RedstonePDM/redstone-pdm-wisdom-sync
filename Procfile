@@ -1,1 +1,1 @@
-worker: python src/wisdom_sync.py
+worker: python wisdom_sync.py
