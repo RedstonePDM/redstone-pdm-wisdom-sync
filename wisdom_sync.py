@@ -145,11 +145,10 @@ class WisdomClient:
     def authenticate(self):
         """
         Log in to Wisdom using a real browser (Playwright).
-        The login page uses AngularJS AJAX - a standard HTTP POST does not
-        complete the SAP session handshake. Playwright runs a headless browser
-        that executes the JavaScript login flow properly, then we extract all
-        session cookies and use them for direct API calls.
-        READ-ONLY: we only navigate and extract cookies, never submit data.
+        Uses Playwright for the full login flow AND all API calls, since the
+        SAP session cookies are path-restricted and only work inside the browser
+        context. API responses are returned as JSON text and parsed in Python.
+        READ-ONLY: we only navigate and fetch data, never submit or modify anything.
         """
         log.info("Authenticating with Wisdom via browser...")
 
@@ -165,74 +164,48 @@ class WisdomClient:
             page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
             log.info("Login page loaded.")
 
-            # Fill in credentials using confirmed Wisdom field names from page HTML
+            # Fill in credentials using confirmed Wisdom field names
             page.fill("input[name='sap-alias']", WISDOM_EMAIL)
             page.fill("input[name='sap-password']", WISDOM_PASSWORD)
-
-            # Submit using the SAP login function via JavaScript
             page.evaluate("callSubmitLogin('onLogin')")
-
-            # Wait for navigation to complete
             page.wait_for_load_state("networkidle", timeout=60000)
             log.info(f"Post-login URL: {page.url}")
 
-            # Extract all cookies
-            cookies = context.cookies()
-            log.info(f"Extracted {len(cookies)} cookies after login")
-            for c in cookies:
-                log.info(f"  Cookie: {c['name']} path={c['path']}")
+            # Validate session by fetching a known job via the browser context
+            log.info("Validating session via browser fetch...")
+            result = page.evaluate(f"""
+                async () => {{
+                    const resp = await fetch("{WISDOM_DATA}/JobSet('10002107640')", {{
+                        headers: {{
+                            "Accept": "application/json",
+                            "X-Requested-With": "XMLHttpRequest"
+                        }}
+                    }});
+                    return {{ status: resp.status, text: await resp.text() }};
+                }}
+            """)
+            log.info(f"Validation fetch: status={result['status']}, length={len(result['text'])}")
+            log.info(f"Validation preview: {result['text'][:300]}")
 
-            # Get CSRF token from page context if available
-            # Try to get CSRF from Angular context - may fail if page has navigated, that's OK
+            if result["status"] != 200:
+                raise RuntimeError(f"Browser fetch validation failed: HTTP {result['status']}")
+
+            import json as _json
             try:
-                csrf = page.evaluate("() => { try { return angular.element(document.body).injector().get('$http').defaults.headers.common['X-Csrf-Token']; } catch(e) { return null; } }")
-                if csrf:
-                    log.info(f"CSRF from Angular context: {csrf[:20]}...")
+                data = _json.loads(result["text"])
+                if not data.get("d", {}).get("JobId"):
+                    raise RuntimeError("Validation response has no JobId")
+                log.info("Browser session validated successfully.")
             except Exception as e:
-                log.info(f"Angular CSRF extract skipped (page navigated): {e}")
+                raise RuntimeError(f"Validation parse error: {e}, body: {result['text'][:300]}")
 
-            browser.close()
-
-        # Load cookies into requests session with path=/
-        for c in cookies:
-            self.session.cookies.set(
-                c["name"], c["value"],
-                domain="wisdom.jdwetherspoon.co.uk",
-                path="/"
-            )
-        log.info(f"Loaded {len(cookies)} cookies into requests session.")
-
-        # Fetch CSRF token via requests
-        csrf_resp = self.session.get(
-            f"{WISDOM_DATA}/JobSet('10002107640')",
-            headers={"X-Csrf-Token": "Fetch"},
-            timeout=30
-        )
-        fetched_csrf = csrf_resp.headers.get("X-Csrf-Token")
-        if fetched_csrf:
-            self.session.headers["X-Csrf-Token"] = fetched_csrf
-            log.info("CSRF token acquired.")
-
-        # Validate
-        test = self.session.get(
-            f"{WISDOM_DATA}/JobSet('10002107640')",
-            timeout=30
-        )
-        log.info(f"Validation: {test.status_code}, length: {len(test.text)}")
-        if test.status_code == 200:
-            try:
-                data = test.json()
-                if data.get("d", {}).get("JobId"):
-                    self.authenticated = True
-                    log.info("Authentication successful.")
-                else:
-                    log.error(f"Response: {test.text[:300]}")
-                    raise RuntimeError("Got 200 but no job data.")
-            except Exception as e:
-                log.error(f"Parse error: {e}, body: {test.text[:300]}")
-                raise
-        else:
-            raise RuntimeError(f"Authentication failed. Status: {test.status_code}")
+            # Store the browser context for all subsequent API calls
+            self._playwright = p
+            self._browser = browser
+            self._context = context
+            self._page = page
+            self.authenticated = True
+            log.info("Authentication successful. Using browser context for all API calls.")
 
     def _extract_csrf(self, response):
         """Try to extract CSRF token from response headers or HTML."""
@@ -243,6 +216,24 @@ class WisdomClient:
         if match:
             return match.group(1)
         return None
+
+    def _browser_fetch(self, url):
+        """Make a GET request via the browser context to use the live SAP session."""
+        import json as _json
+        result = self._page.evaluate(f"""
+            async () => {{
+                const resp = await fetch("{url}", {{
+                    headers: {{
+                        "Accept": "application/json",
+                        "X-Requested-With": "XMLHttpRequest"
+                    }}
+                }});
+                return {{ status: resp.status, text: await resp.text() }};
+            }}
+        """)
+        if result["status"] != 200:
+            raise RuntimeError(f"Browser fetch failed: HTTP {result['status']} for {url}")
+        return _json.loads(result["text"])
 
     def get_job_list(self, tab, item, skip=0, top=PAGE_SIZE):
         """
@@ -257,14 +248,10 @@ class WisdomClient:
             f"?$skip={skip}&$top={top}&$inlinecount=allpages"
         )
         log.info(f"Fetching: {url}")
-        resp = self.session.get(url, timeout=30)
-        log.info(f"Status: {resp.status_code}, Length: {len(resp.text)}")
-        if resp.text:
-            log.info(f"Preview: {resp.text[:300]}")
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._browser_fetch(url)
         results = data.get("d", {}).get("results", [])
         total   = int(data.get("d", {}).get("__count", len(results)))
+        log.info(f"Got {len(results)} of {total} jobs")
         return results, total
 
     def get_job_detail(self, job_id):
@@ -273,9 +260,8 @@ class WisdomClient:
         READ-ONLY: GET request only.
         """
         url = f"{WISDOM_DATA}/JobSet('{job_id}')"
-        resp = self.session.get(url, timeout=30)
-        resp.raise_for_status()
-        return resp.json().get("d", {})
+        data = self._browser_fetch(url)
+        return data.get("d", {})
 
     def get_pub_postcode(self, pub_id):
         """
@@ -289,10 +275,10 @@ class WisdomClient:
         )
         try:
             url = f"{WISDOM_DATA}/PubSet('{pub_id}')"
-            resp = self.session.get(url, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json().get("d", {})
-                log.info(f"PubSet({pub_id}) string fields: { {k: v for k, v in data.items() if isinstance(v, str) and v} }")
+            data = self._browser_fetch(url)
+            data = data.get("d", {})
+            log.info(f"PubSet({pub_id}) string fields: { {k: v for k, v in data.items() if isinstance(v, str) and v} }")
+            if True:
 
                 # First try dedicated postcode fields
                 postcode = (
@@ -316,8 +302,6 @@ class WisdomClient:
                     log.warning(f"PubSet({pub_id}): no postcode found. Full response: {data}")
 
                 return postcode
-            else:
-                log.warning(f"PubSet({pub_id}): HTTP {resp.status_code} - {resp.text[:200]}")
         except Exception as e:
             log.warning(f"Pub postcode lookup failed for pub_id={pub_id}: {e}")
         return ""
@@ -579,6 +563,14 @@ def run_sync():
 
     cur.close()
     conn.close()
+
+    # Close the browser after all syncs complete
+    try:
+        client._browser.close()
+        log.info("Browser closed.")
+    except Exception:
+        pass
+
     log.info("Sync complete.")
 
 
