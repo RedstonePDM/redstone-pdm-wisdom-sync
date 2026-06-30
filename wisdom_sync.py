@@ -168,21 +168,26 @@ class WisdomClient:
             page.fill("input[name='sap-alias']", WISDOM_EMAIL)
             page.fill("input[name='sap-password']", WISDOM_PASSWORD)
             page.evaluate("callSubmitLogin('onLogin')")
+
+            # Wait for the post-login page to fully load and settle
             page.wait_for_load_state("networkidle", timeout=60000)
+            # Extra wait to ensure any post-login redirects complete
+            page.wait_for_timeout(2000)
+            page.wait_for_load_state("networkidle", timeout=30000)
             log.info(f"Post-login URL: {page.url}")
 
             # Validate session by fetching a known job via the browser context
             log.info("Validating session via browser fetch...")
-            result = page.evaluate(f"""
-                async () => {{
-                    const resp = await fetch("{WISDOM_DATA}/JobSet('10002107640')", {{
-                        headers: {{
+            result = page.evaluate("""
+                async () => {
+                    const resp = await fetch("https://wisdom.jdwetherspoon.co.uk/WISDOM_DATA/JobSet('10002107640')", {
+                        headers: {
                             "Accept": "application/json",
                             "X-Requested-With": "XMLHttpRequest"
-                        }}
-                    }});
-                    return {{ status: resp.status, text: await resp.text() }};
-                }}
+                        }
+                    });
+                    return { status: resp.status, text: await resp.text() };
+                }
             """)
             log.info(f"Validation fetch: status={result['status']}, length={len(result['text'])}")
             log.info(f"Validation preview: {result['text'][:300]}")
@@ -220,17 +225,16 @@ class WisdomClient:
     def _browser_fetch(self, url):
         """Make a GET request via the browser context to use the live SAP session."""
         import json as _json
-        result = self._page.evaluate(f"""
-            async () => {{
-                const resp = await fetch("{url}", {{
-                    headers: {{
-                        "Accept": "application/json",
-                        "X-Requested-With": "XMLHttpRequest"
-                    }}
-                }});
-                return {{ status: resp.status, text: await resp.text() }};
-            }}
-        """)
+        result = self._page.evaluate(
+            """(url) => fetch(url, {
+                headers: {
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest"
+                }
+            }).then(r => r.text().then(t => ({ status: r.status, text: t })))""",
+            url
+        )
+        log.debug(f"Browser fetch {url}: status={result['status']}")
         if result["status"] != 200:
             raise RuntimeError(f"Browser fetch failed: HTTP {result['status']} for {url}")
         return _json.loads(result["text"])
