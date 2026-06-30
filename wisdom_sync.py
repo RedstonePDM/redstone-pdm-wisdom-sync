@@ -22,6 +22,7 @@ import requests
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone
+from playwright.sync_api import sync_playwright
 from urllib.parse import urljoin
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -135,62 +136,62 @@ class WisdomClient:
         self.authenticated = False
 
     def authenticate(self):
-        """Log in to Wisdom and capture session cookies."""
-        log.info("Authenticating with Wisdom...")
+        """
+        Log in to Wisdom using a real browser (Playwright).
+        The login page uses AngularJS AJAX - a standard HTTP POST does not
+        complete the SAP session handshake. Playwright runs a headless browser
+        that executes the JavaScript login flow properly, then we extract all
+        session cookies and use them for direct API calls.
+        READ-ONLY: we only navigate and extract cookies, never submit data.
+        """
+        log.info("Authenticating with Wisdom via browser...")
 
-        # Step 1: Load the login page to get initial cookies
-        resp = self.session.get(WISDOM_LOGIN, timeout=30)
-        resp.raise_for_status()
-        log.info(f"Login page status: {resp.status_code}, url: {resp.url}")
-        log.info(f"Login page cookies: {list(self.session.cookies.keys())}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
 
-        # Step 2: Submit login credentials - track ALL redirects
-        login_payload = {
-            "sap-user":   WISDOM_EMAIL,
-            "sap-passwd": WISDOM_PASSWORD,
-        }
+            # Navigate to login page
+            log.info(f"Navigating to: {WISDOM_LOGIN}")
+            page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
+            log.info("Login page loaded.")
 
-        # First try WITHOUT following redirects to see where it sends us
-        login_resp = self.session.post(
-            WISDOM_LOGIN,
-            data=login_payload,
-            timeout=30,
-            allow_redirects=False
-        )
-        log.info(f"Login POST status: {login_resp.status_code}")
-        log.info(f"Login POST location: {login_resp.headers.get('Location', 'none')}")
-        log.info(f"Login POST cookies set: {list(login_resp.cookies.keys())}")
+            # Fill in credentials
+            page.fill("input[name='sap-user'], #USERNAME, input[type='text']", WISDOM_EMAIL)
+            page.fill("input[name='sap-passwd'], #PASSWORD, input[type='password']", WISDOM_PASSWORD)
 
-        # Follow redirects manually to capture all intermediate cookies
-        redirect_url = login_resp.headers.get("Location")
-        hop = 0
-        while redirect_url and hop < 10:
-            hop += 1
-            if not redirect_url.startswith("http"):
-                redirect_url = f"{WISDOM_BASE}{redirect_url}"
-            log.info(f"Following redirect {hop}: {redirect_url}")
-            r = self.session.get(redirect_url, timeout=30, allow_redirects=False)
-            log.info(f"  Status: {r.status_code}, cookies: {list(r.cookies.keys())}")
-            log.info(f"  All session cookies now: {list(self.session.cookies.keys())}")
-            redirect_url = r.headers.get("Location")
+            # Click login button
+            page.click("input[type='submit'], button[type='submit'], .loginButton, #LOGIN_LINK")
 
-        log.info(f"Final cookies: {list(self.session.cookies.keys())}")
+            # Wait for navigation to complete
+            page.wait_for_load_state("networkidle", timeout=60000)
+            log.info(f"Post-login URL: {page.url}")
 
-        # Step 3: Force ALL cookies to path=/
-        all_cookies = {}
-        for cookie in self.session.cookies:
-            all_cookies[cookie.name] = cookie.value
-            log.info(f"Cookie: {cookie.name} = {cookie.value[:20]}... path={cookie.path}")
+            # Extract all cookies
+            cookies = context.cookies()
+            log.info(f"Extracted {len(cookies)} cookies after login")
+            for c in cookies:
+                log.info(f"  Cookie: {c['name']} path={c['path']}")
 
-        self.session.cookies.clear()
-        for name, value in all_cookies.items():
+            # Get CSRF token from page context if available
+            csrf = page.evaluate("() => { try { return angular.element(document.body).injector().get('$http').defaults.headers.common['X-Csrf-Token']; } catch(e) { return null; } }")
+            if csrf:
+                log.info(f"CSRF from Angular context: {csrf[:20]}...")
+
+            browser.close()
+
+        # Load cookies into requests session with path=/
+        for c in cookies:
             self.session.cookies.set(
-                name, value,
+                c["name"], c["value"],
                 domain="wisdom.jdwetherspoon.co.uk",
                 path="/"
             )
+        log.info(f"Loaded {len(cookies)} cookies into requests session.")
 
-        # Step 4: Fetch CSRF token
+        # Fetch CSRF token via requests
         csrf_resp = self.session.get(
             f"{WISDOM_DATA}/JobSet('10002107640')",
             headers={"X-Csrf-Token": "Fetch"},
@@ -199,16 +200,14 @@ class WisdomClient:
         fetched_csrf = csrf_resp.headers.get("X-Csrf-Token")
         if fetched_csrf:
             self.session.headers["X-Csrf-Token"] = fetched_csrf
-            log.info(f"CSRF token acquired.")
+            log.info("CSRF token acquired.")
 
-        # Step 5: Validate
+        # Validate
         test = self.session.get(
             f"{WISDOM_DATA}/JobSet('10002107640')",
             timeout=30
         )
         log.info(f"Validation: {test.status_code}, length: {len(test.text)}")
-        log.info(f"Validation preview: {test.text[:200]}")
-
         if test.status_code == 200:
             try:
                 data = test.json()
@@ -216,9 +215,10 @@ class WisdomClient:
                     self.authenticated = True
                     log.info("Authentication successful.")
                 else:
+                    log.error(f"Response: {test.text[:300]}")
                     raise RuntimeError("Got 200 but no job data.")
             except Exception as e:
-                log.error(f"Parse error: {e}")
+                log.error(f"Parse error: {e}, body: {test.text[:300]}")
                 raise
         else:
             raise RuntimeError(f"Authentication failed. Status: {test.status_code}")
