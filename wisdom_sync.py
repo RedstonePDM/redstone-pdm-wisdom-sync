@@ -425,14 +425,20 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
                 # Fetch full detail for each job (gets description etc.)
                 try:
                     if fixed_desc:
+                        # MIV jobs use summary data with fixed description
+                        # but still need postcode lookup from pub
                         job_detail = job_summary
                     else:
                         job_detail = client.get_job_detail(job_id)
                         time.sleep(0.2)
 
-                    # Extract postcode from pub location if not already on the job record
-                    if not job_detail.get("PostCode"):
-                        location = job_detail.get("Location", "")
+                    # Extract postcode from pub location for ALL job types including MIV
+                    if not job_detail.get("PostCode") and not job_detail.get("_postcode"):
+                        location = (
+                            job_detail.get("Location", "")
+                            or job_detail.get("LocationCode", "")
+                            or job_summary.get("Location", "")
+                        )
                         parts = location.split("-") if location else []
                         if len(parts) >= 2:
                             pub_id = parts[1]
@@ -445,6 +451,8 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
                             if postcode:
                                 job_detail["_postcode"] = postcode
                                 log.info(f"Job {job_id}: postcode set to {postcode} from pub {pub_id}")
+                        else:
+                            log.debug(f"Job {job_id}: no location code found for postcode lookup (location={location!r})")
 
                 except Exception as e:
                     log.warning(f"Could not fetch detail for job {job_id}: {e}")
