@@ -158,12 +158,12 @@ class WisdomClient:
             page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
             log.info("Login page loaded.")
 
-            # Fill in credentials
-            page.fill("input[name='sap-user'], #USERNAME, input[type='text']", WISDOM_EMAIL)
-            page.fill("input[name='sap-passwd'], #PASSWORD, input[type='password']", WISDOM_PASSWORD)
+            # Fill in credentials using exact field IDs from Wisdom login page
+            page.fill("#sap-alias", WISDOM_EMAIL)
+            page.fill("#sap-password", WISDOM_PASSWORD)
 
             # Click login button
-            page.click("input[type='submit'], button[type='submit'], .loginButton, #LOGIN_LINK")
+            page.click("#submitBtn")
 
             # Wait for navigation to complete
             page.wait_for_load_state("networkidle", timeout=60000)
