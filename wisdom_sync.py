@@ -59,7 +59,14 @@ PAGE_SIZE = 200  # Fetch up to 200 jobs per tab in one call
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    """Return a psycopg2 connection with RealDictCursor as default."""
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
+
+def get_dict_cursor(conn):
+    """Return a RealDictCursor for dict-style row access."""
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def init_db():
@@ -223,7 +230,6 @@ class WisdomClient:
         else:
             raise RuntimeError(f"Authentication failed. Status: {test.status_code}")
 
-
     def _extract_csrf(self, response):
         """Try to extract CSRF token from response headers or HTML."""
         token = response.headers.get("X-Csrf-Token")
@@ -272,15 +278,54 @@ class WisdomClient:
         Fetch pub postcode directly from PubSet API.
         Pub ID extracted from Location field e.g. JDW-5779-22 -> 5779
         READ-ONLY: GET request only.
+
+        Logs all field names returned on first call to help identify
+        the correct postcode field name if PostCode doesn't match.
         """
         try:
             url = f"{WISDOM_DATA}/PubSet('{pub_id}')"
             resp = self.session.get(url, timeout=15)
             if resp.status_code == 200:
                 data = resp.json().get("d", {})
-                return (data.get("PostCode") or "").strip()
+
+                # Log all field names so we can identify the correct postcode field
+                log.info(f"PubSet({pub_id}) fields returned: {list(data.keys())}")
+
+                # Try all likely postcode field name variants
+                postcode = (
+                    data.get("PostCode")
+                    or data.get("Postcode")
+                    or data.get("PostalCode")
+                    or data.get("ZipCode")
+                    or data.get("ZIPCode")
+                    or data.get("SitePostCode")
+                    or data.get("PubPostCode")
+                    or ""
+                )
+
+                # If still nothing, scan all string values for a UK postcode pattern
+                if not postcode:
+                    uk_postcode_re = re.compile(
+                        r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.I
+                    )
+                    for key, val in data.items():
+                        if isinstance(val, str):
+                            match = uk_postcode_re.search(val)
+                            if match:
+                                postcode = match.group(1).strip()
+                                log.info(f"PubSet({pub_id}): postcode found in field '{key}': {postcode}")
+                                break
+
+                if postcode:
+                    log.info(f"PubSet({pub_id}): postcode = {postcode.strip()}")
+                else:
+                    log.warning(f"PubSet({pub_id}): no postcode found in any field")
+
+                return postcode.strip()
+            else:
+                log.warning(f"PubSet({pub_id}): HTTP {resp.status_code}")
         except Exception as e:
-            log.debug(f"Pub postcode lookup failed for {pub_id}: {e}")
+            log.warning(f"Pub postcode lookup failed for {pub_id}: {e}")
         return ""
 
 
@@ -296,9 +341,8 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
 
     description = fixed_description or job_data.get("Description", "").strip()
 
-    # Extract postcode from location data if available
-    # Extract postcode - passed in via job_data if available
-    postcode = job_data.get("PostCode", "") or job_data.get("_postcode", "") or ""
+    # Extract postcode — injected as _postcode from pub lookup during sync
+    postcode = (job_data.get("PostCode") or job_data.get("_postcode") or "").strip()
 
     now = datetime.now(timezone.utc)
 
@@ -353,11 +397,16 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
         """, row)
         return True, False  # is_new=True, is_updated=False
     else:
+        # Only update postcode if we now have one and didn't before
         cur.execute("""
             UPDATE jobs SET
                 tab=%(tab)s, sub_tab=%(sub_tab)s, tab_label=%(tab_label)s,
                 job_type=%(job_type)s, pub_name=%(pub_name)s,
-                location_code=%(location_code)s, postcode=%(postcode)s,
+                location_code=%(location_code)s,
+                postcode=CASE
+                    WHEN %(postcode)s != '' THEN %(postcode)s
+                    ELSE postcode
+                END,
                 area=%(area)s, trade_type=%(trade_type)s,
                 sub_trade_type=%(sub_trade_type)s, description=%(description)s,
                 additional_text=%(additional_text)s,
@@ -404,18 +453,21 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
                         job_detail = client.get_job_detail(job_id)
                         time.sleep(0.2)
 
-                    # Extract postcode from pub location
+                    # Extract postcode from pub location if not already on the job record
                     if not job_detail.get("PostCode"):
                         location = job_detail.get("Location", "")
                         parts = location.split("-") if location else []
                         if len(parts) >= 2:
                             pub_id = parts[1]
-                            postcode = pub_postcode_cache.get(pub_id)
-                            if postcode is None:
+                            if pub_id not in pub_postcode_cache:
                                 postcode = client.get_pub_postcode(pub_id)
                                 pub_postcode_cache[pub_id] = postcode
                                 time.sleep(0.1)
-                            job_detail["_postcode"] = postcode
+                            else:
+                                postcode = pub_postcode_cache[pub_id]
+                            if postcode:
+                                job_detail["_postcode"] = postcode
+                                log.info(f"Job {job_id}: postcode set to {postcode} from pub {pub_id}")
 
                 except Exception as e:
                     log.warning(f"Could not fetch detail for job {job_id}: {e}")
@@ -454,28 +506,44 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
 
 
 def backfill_postcodes(client, conn, cur):
-    """One-time backfill: fetch postcodes for all jobs that are missing them."""
-    cur.execute("SELECT COUNT(*) as c FROM jobs WHERE postcode IS NULL OR postcode = ''")
-    count = cur.fetchone()["c"]
+    """
+    Backfill postcodes for all jobs that are missing them.
+    Runs at the start of every sync cycle.
+    Uses a RealDictCursor explicitly to avoid tuple/dict access errors.
+    """
+    # Use a dedicated dict cursor for this function
+    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    dict_cur.execute(
+        "SELECT COUNT(*) as c FROM jobs WHERE postcode IS NULL OR postcode = ''"
+    )
+    row = dict_cur.fetchone()
+    count = row["c"] if row else 0
+
     if count == 0:
         log.info("Postcode backfill: all jobs already have postcodes.")
+        dict_cur.close()
         return
 
     log.info(f"Postcode backfill: {count} jobs missing postcodes. Fetching...")
-    cur.execute("""
+
+    dict_cur.execute("""
         SELECT DISTINCT location_code FROM jobs
         WHERE (postcode IS NULL OR postcode = '')
         AND location_code IS NOT NULL AND location_code != ''
     """)
-    locations = [r["location_code"] for r in cur.fetchall()]
+    locations = [r["location_code"] for r in dict_cur.fetchall()]
+    dict_cur.close()
 
     pub_cache = {}
     updated = 0
+
     for location in locations:
         parts = location.split("-") if location else []
         if len(parts) < 2:
             continue
         pub_id = parts[1]
+
         if pub_id not in pub_cache:
             postcode = client.get_pub_postcode(pub_id)
             pub_cache[pub_id] = postcode
@@ -486,12 +554,16 @@ def backfill_postcodes(client, conn, cur):
         if postcode:
             cur.execute("""
                 UPDATE jobs SET postcode = %s
-                WHERE location_code = %s AND (postcode IS NULL OR postcode = '')
+                WHERE location_code = %s
+                AND (postcode IS NULL OR postcode = '')
             """, (postcode, location))
             updated += cur.rowcount
 
     conn.commit()
-    log.info(f"Postcode backfill complete: updated {updated} jobs across {len(pub_cache)} pubs.")
+    log.info(
+        f"Postcode backfill complete: updated {updated} jobs "
+        f"across {len(pub_cache)} unique pubs."
+    )
 
 
 def run_sync():
@@ -510,7 +582,7 @@ def run_sync():
     try:
         backfill_postcodes(client, conn, cur)
     except Exception as e:
-        log.error(f"Postcode backfill failed: {e}")
+        log.error(f"Postcode backfill failed: {e}", exc_info=True)
 
     for target in EXTRACTION_TARGETS:
         sync_target(client, target, conn, cur)
@@ -539,7 +611,7 @@ if __name__ == "__main__":
             try:
                 run_sync()
             except Exception as e:
-                log.error(f"Sync cycle failed: {e}")
+                log.error(f"Sync cycle failed: {e}", exc_info=True)
 
             log.info(f"Next sync in {sync_interval} minutes.")
             time.sleep(sync_interval * 60)
