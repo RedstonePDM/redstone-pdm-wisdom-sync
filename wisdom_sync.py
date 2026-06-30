@@ -138,49 +138,73 @@ class WisdomClient:
         """Log in to Wisdom and capture session cookies."""
         log.info("Authenticating with Wisdom...")
 
-        # Step 1: Load the login page to get initial cookies and CSRF token
+        # Step 1: Load the login page to get initial cookies
         resp = self.session.get(WISDOM_LOGIN, timeout=30)
         resp.raise_for_status()
+        log.info(f"Login page cookies: {list(self.session.cookies.keys())}")
 
-        # Step 2: Extract CSRF token from page or cookies
-        csrf_token = self._extract_csrf(resp)
-
-        # Step 3: Submit login credentials
+        # Step 2: Submit login credentials
         login_payload = {
             "sap-user":   WISDOM_EMAIL,
             "sap-passwd": WISDOM_PASSWORD,
         }
-        if csrf_token:
-            self.session.headers["X-Csrf-Token"] = csrf_token
-
         login_resp = self.session.post(
             WISDOM_LOGIN,
             data=login_payload,
             timeout=30,
             allow_redirects=True
         )
+        log.info(f"Post-login cookies: {list(self.session.cookies.keys())}")
 
-        # Step 4: Fetch CSRF token for OData calls
+        # Step 3: Force ALL cookies to path=/ so they are sent to /WISDOM_DATA
+        # SAP sets cookies with restrictive paths (/WIS) which blocks them from
+        # reaching the OData API at /WISDOM_DATA
+        all_cookies = {}
+        for cookie in self.session.cookies:
+            all_cookies[cookie.name] = cookie.value
+            log.info(f"Cookie: {cookie.name} path={cookie.path}")
+
+        self.session.cookies.clear()
+        for name, value in all_cookies.items():
+            self.session.cookies.set(
+                name, value,
+                domain="wisdom.jdwetherspoon.co.uk",
+                path="/"
+            )
+        log.info(f"Normalised {len(all_cookies)} cookies to path=/")
+
+        # Step 4: Fetch CSRF token from a known job endpoint
         csrf_resp = self.session.get(
-            f"{WISDOM_DATA}/$metadata",
+            f"{WISDOM_DATA}/JobSet('10002107640')",
             headers={"X-Csrf-Token": "Fetch"},
             timeout=30
         )
         fetched_csrf = csrf_resp.headers.get("X-Csrf-Token")
         if fetched_csrf:
             self.session.headers["X-Csrf-Token"] = fetched_csrf
-            log.info("CSRF token acquired.")
+            log.info(f"CSRF token acquired.")
 
-        # Validate authentication by attempting a simple API call
+        # Step 5: Validate by fetching a known job
         test = self.session.get(
             f"{WISDOM_DATA}/JobSet('10002107640')",
             timeout=30
         )
+        log.info(f"Validation status: {test.status_code}, length: {len(test.text)}")
         if test.status_code == 200:
-            self.authenticated = True
-            log.info("Authentication successful.")
+            try:
+                data = test.json()
+                if data.get("d", {}).get("JobId"):
+                    self.authenticated = True
+                    log.info("Authentication successful.")
+                else:
+                    log.error(f"Auth response body: {test.text[:300]}")
+                    raise RuntimeError("Got 200 but no job data - session not authenticated.")
+            except Exception as e:
+                log.error(f"Auth parse error: {e}, body: {test.text[:300]}")
+                raise
         else:
             raise RuntimeError(f"Authentication failed. Status: {test.status_code}")
+
 
     def _extract_csrf(self, response):
         """Try to extract CSRF token from response headers or HTML."""
