@@ -269,24 +269,16 @@ class WisdomClient:
 
     def get_pub_postcode(self, pub_id):
         """
-        Fetch pub details to get postcode from address.
+        Fetch pub postcode directly from PubSet API.
         Pub ID extracted from Location field e.g. JDW-5779-22 -> 5779
         READ-ONLY: GET request only.
         """
-        import re
-        uk_postcode = re.compile(r"[A-Z]{1,2}[0-9][0-9A-Z]?[ ]*[0-9][A-Z]{2}")
         try:
             url = f"{WISDOM_DATA}/PubSet('{pub_id}')"
             resp = self.session.get(url, timeout=15)
             if resp.status_code == 200:
                 data = resp.json().get("d", {})
-                # Check all address fields for postcode
-                for field in ["PostCode", "Address1", "Address2", "Address3", "Address"]:
-                    val = (data.get(field) or "").upper().strip()
-                    if val:
-                        match = uk_postcode.search(val)
-                        if match:
-                            return match.group(0).strip()
+                return (data.get("PostCode") or "").strip()
         except Exception as e:
             log.debug(f"Pub postcode lookup failed for {pub_id}: {e}")
         return ""
