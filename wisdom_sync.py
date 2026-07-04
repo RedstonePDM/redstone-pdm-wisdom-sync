@@ -154,7 +154,7 @@ class WisdomClient:
 
         # Navigate to login page
         log.info(f"Navigating to: {WISDOM_LOGIN}")
-        await self._page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
+        await self._page.goto(WISDOM_LOGIN, wait_until="domcontentloaded", timeout=60000)
         log.info("Login page loaded.")
 
         # Fill credentials
@@ -163,9 +163,9 @@ class WisdomClient:
         await self._page.evaluate("callSubmitLogin('onLogin')")
 
         # Wait for post-login page to settle
-        await self._page.wait_for_load_state("networkidle", timeout=60000)
+        await self._page.wait_for_load_state("domcontentloaded", timeout=60000)
         await self._page.wait_for_timeout(2000)
-        await self._page.wait_for_load_state("networkidle", timeout=30000)
+        await self._page.wait_for_load_state("domcontentloaded", timeout=30000)
         log.info(f"Post-login URL: {self._page.url}")
 
         # Validate session
