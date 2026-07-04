@@ -17,12 +17,13 @@ This service is READ-ONLY without exception.
 import os
 import re
 import time
+import asyncio
 import logging
 import requests
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from urllib.parse import urljoin
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -119,67 +120,57 @@ def init_db():
     log.info("Database initialised.")
 
 
-# ── Wisdom Authentication ─────────────────────────────────────────────────────
+# ── Wisdom Client (Async Playwright) ──────────────────────────────────────────
 
 class WisdomClient:
     """
     Read-only HTTP client for the Wisdom OData API.
-    Authenticates via session cookie. Never issues write requests.
+    Uses async Playwright to avoid asyncio loop conflicts.
+    Never issues write requests.
     """
 
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Accept":           "application/json",
-            "Accept-Encoding":  "gzip, deflate, br",
-            "Accept-Language":  "en-GB,en-US;q=0.9,en;q=0.8",
-            "X-Requested-With": "XMLHttpRequest",
-            "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-            "Referer":          WISDOM_LOGIN,
-            "Sec-Fetch-Dest":   "empty",
-            "Sec-Fetch-Mode":   "cors",
-            "Sec-Fetch-Site":   "same-origin",
-        })
         self.authenticated = False
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
 
-    def authenticate(self):
+    async def authenticate(self):
         """
-        Log in to Wisdom using a real browser (Playwright).
-        Uses Playwright for the full login flow AND all API calls, since the
-        SAP session cookies are path-restricted and only work inside the browser
-        context. API responses are returned as JSON text and parsed in Python.
+        Log in to Wisdom using async Playwright.
+        Keeps the browser alive for all subsequent API calls.
         READ-ONLY: we only navigate and fetch data, never submit or modify anything.
         """
         import json as _json
-        log.info("Authenticating with Wisdom via browser...")
+        log.info("Authenticating with Wisdom via browser (async)...")
 
-        # Start Playwright without context manager so it stays alive for all API calls
-        self._playwright = sync_playwright().start()
-        browser = self._playwright.chromium.launch(headless=True)
-        context = browser.new_context(
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(headless=True)
+        self._context = await self._browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
         )
-        page = context.new_page()
+        self._page = await self._context.new_page()
 
         # Navigate to login page
         log.info(f"Navigating to: {WISDOM_LOGIN}")
-        page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
+        await self._page.goto(WISDOM_LOGIN, wait_until="networkidle", timeout=60000)
         log.info("Login page loaded.")
 
-        # Fill in credentials using confirmed Wisdom field names
-        page.fill("input[name='sap-alias']", WISDOM_EMAIL)
-        page.fill("input[name='sap-password']", WISDOM_PASSWORD)
-        page.evaluate("callSubmitLogin('onLogin')")
+        # Fill credentials
+        await self._page.fill("input[name='sap-alias']", WISDOM_EMAIL)
+        await self._page.fill("input[name='sap-password']", WISDOM_PASSWORD)
+        await self._page.evaluate("callSubmitLogin('onLogin')")
 
-        # Wait for the post-login page to fully load and settle
-        page.wait_for_load_state("networkidle", timeout=60000)
-        page.wait_for_timeout(2000)
-        page.wait_for_load_state("networkidle", timeout=30000)
-        log.info(f"Post-login URL: {page.url}")
+        # Wait for post-login page to settle
+        await self._page.wait_for_load_state("networkidle", timeout=60000)
+        await self._page.wait_for_timeout(2000)
+        await self._page.wait_for_load_state("networkidle", timeout=30000)
+        log.info(f"Post-login URL: {self._page.url}")
 
-        # Validate session by fetching a known job via the browser context
+        # Validate session
         log.info("Validating session via browser fetch...")
-        result = page.evaluate("""
+        result = await self._page.evaluate("""
             async () => {
                 const resp = await fetch("https://wisdom.jdwetherspoon.co.uk/WISDOM_DATA/JobSet('10002107640')", {
                     headers: {
@@ -204,27 +195,13 @@ class WisdomClient:
         except Exception as e:
             raise RuntimeError(f"Validation parse error: {e}, body: {result['text'][:300]}")
 
-        # Store browser page for all subsequent API calls
-        self._browser = browser
-        self._context = context
-        self._page = page
         self.authenticated = True
         log.info("Authentication successful. Browser stays open for all API calls.")
 
-    def _extract_csrf(self, response):
-        """Try to extract CSRF token from response headers or HTML."""
-        token = response.headers.get("X-Csrf-Token")
-        if token:
-            return token
-        match = re.search(r'csrf[_-]?token["\s:=]+([A-Za-z0-9+/=]+)', response.text, re.I)
-        if match:
-            return match.group(1)
-        return None
-
-    def _browser_fetch(self, url):
-        """Make a GET request via the browser context to use the live SAP session."""
+    async def _browser_fetch(self, url):
+        """Make a GET request via the browser context using the live SAP session."""
         import json as _json
-        result = self._page.evaluate(
+        result = await self._page.evaluate(
             """(url) => fetch(url, {
                 headers: {
                     "Accept": "application/json",
@@ -238,7 +215,7 @@ class WisdomClient:
             raise RuntimeError(f"Browser fetch failed: HTTP {result['status']} for {url}")
         return _json.loads(result["text"])
 
-    def get_job_list(self, tab, item, skip=0, top=PAGE_SIZE):
+    async def get_job_list(self, tab, item, skip=0, top=PAGE_SIZE):
         """
         Fetch list of jobs for a given tab/sub-tab combination.
         Returns list of job objects from the OData response.
@@ -251,26 +228,24 @@ class WisdomClient:
             f"?$skip={skip}&$top={top}&$inlinecount=allpages"
         )
         log.info(f"Fetching: {url}")
-        data = self._browser_fetch(url)
+        data = await self._browser_fetch(url)
         results = data.get("d", {}).get("results", [])
         total   = int(data.get("d", {}).get("__count", len(results)))
         log.info(f"Got {len(results)} of {total} jobs")
         return results, total
 
-    def get_job_detail(self, job_id):
+    async def get_job_detail(self, job_id):
         """
         Fetch full detail for a single job by ID.
         READ-ONLY: GET request only.
         """
         url = f"{WISDOM_DATA}/JobSet('{job_id}')"
-        data = self._browser_fetch(url)
+        data = await self._browser_fetch(url)
         return data.get("d", {})
 
-    def get_pub_postcode(self, pub_id):
+    async def get_pub_postcode(self, pub_id):
         """
         Fetch pub postcode from PubSet API.
-        Wisdom returns the address as a single string e.g. '25 High Street OX14 5AA Abingdon'
-        so we extract the UK postcode via regex from any string field.
         READ-ONLY: GET request only.
         """
         uk_postcode_re = re.compile(
@@ -278,36 +253,45 @@ class WisdomClient:
         )
         try:
             url = f"{WISDOM_DATA}/PubSet('{pub_id}')"
-            data = self._browser_fetch(url)
+            data = await self._browser_fetch(url)
             data = data.get("d", {})
             log.info(f"PubSet({pub_id}) string fields: { {k: v for k, v in data.items() if isinstance(v, str) and v} }")
-            if True:
 
-                # First try dedicated postcode fields
-                postcode = (
-                    data.get("PostCode", "") or data.get("Postcode", "") or data.get("PostalCode", "") or ""
-                ).strip()
+            postcode = (
+                data.get("PostCode", "") or data.get("Postcode", "") or data.get("PostalCode", "") or ""
+            ).strip()
 
-                # If no dedicated field, scan every string field for a UK postcode pattern
-                # Covers Address = '25 High Street OX14 5AA Abingdon'
-                if not postcode:
-                    for key, val in data.items():
-                        if isinstance(val, str):
-                            match = uk_postcode_re.search(val)
-                            if match:
-                                postcode = match.group(1).strip()
-                                log.info(f"PubSet({pub_id}): postcode '{postcode}' extracted from field '{key}': {val}")
-                                break
+            if not postcode:
+                for key, val in data.items():
+                    if isinstance(val, str):
+                        match = uk_postcode_re.search(val)
+                        if match:
+                            postcode = match.group(1).strip()
+                            log.info(f"PubSet({pub_id}): postcode '{postcode}' extracted from field '{key}': {val}")
+                            break
 
-                if postcode:
-                    log.info(f"PubSet({pub_id}): final postcode = {postcode}")
-                else:
-                    log.warning(f"PubSet({pub_id}): no postcode found. Full response: {data}")
+            if postcode:
+                log.info(f"PubSet({pub_id}): final postcode = {postcode}")
+            else:
+                log.warning(f"PubSet({pub_id}): no postcode found. Full response: {data}")
 
-                return postcode
+            return postcode
         except Exception as e:
             log.warning(f"Pub postcode lookup failed for pub_id={pub_id}: {e}")
         return ""
+
+    async def close(self):
+        """Close browser and stop Playwright."""
+        try:
+            await self._browser.close()
+            await self._playwright.stop()
+            log.info("Browser closed.")
+        except Exception:
+            pass
+
+
+# ── Database Operations ───────────────────────────────────────────────────────
+
 def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
                tab_label: str, fixed_description: str | None):
     """Insert or update a job record in the database."""
@@ -317,13 +301,9 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
         return False, False
 
     description = fixed_description or job_data.get("Description", "").strip()
-
-    # Extract postcode — injected as _postcode from pub lookup during sync
     postcode = (job_data.get("PostCode") or job_data.get("_postcode") or "").strip()
-
     now = datetime.now(timezone.utc)
 
-    # Check if job already exists
     cur.execute("SELECT job_id, status FROM jobs WHERE job_id = %s", (job_id,))
     existing = cur.fetchone()
 
@@ -372,9 +352,8 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
                 %(status)s, NOW(), %(last_seen)s, %(last_updated)s, %(raw_json)s
             )
         """, row)
-        return True, False  # is_new=True, is_updated=False
+        return True, False
     else:
-        # Only update postcode if we now have one and didn't before
         cur.execute("""
             UPDATE jobs SET
                 tab=%(tab)s, sub_tab=%(sub_tab)s, tab_label=%(tab_label)s,
@@ -396,10 +375,12 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
                 last_updated=%(last_updated)s, raw_json=%(raw_json)s
             WHERE job_id=%(job_id)s
         """, row)
-        return False, True  # is_new=False, is_updated=True
+        return False, True
 
 
-def sync_target(client: WisdomClient, target: tuple, conn, cur):
+# ── Async Sync Logic ──────────────────────────────────────────────────────────
+
+async def sync_target_async(client: WisdomClient, target: tuple, conn, cur):
     """Sync all jobs for one tab/sub-tab target."""
     tab, item, label, fixed_desc = target
     log.info(f"Syncing: {label}")
@@ -410,7 +391,7 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
 
     try:
         while True:
-            results, total = client.get_job_list(tab, item, skip=skip)
+            results, total = await client.get_job_list(tab, item, skip=skip)
 
             if not results:
                 break
@@ -422,25 +403,19 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
                 if not job_id:
                     continue
 
-                # Fetch full detail for each job (gets description etc.)
                 try:
                     if fixed_desc:
-                        # MIV jobs use summary data with fixed description
-                        # but still need postcode lookup from pub
                         job_detail = job_summary
                     else:
-                        job_detail = client.get_job_detail(job_id)
-                        time.sleep(0.2)
+                        job_detail = await client.get_job_detail(job_id)
+                        await asyncio.sleep(0.2)
 
-                    # Extract postcode from pub location for ALL job types including MIV
                     if not job_detail.get("PostCode") and not job_detail.get("_postcode"):
-                        # Try PubId directly first (MIV jobs have this but no Location code)
                         pub_id = (
                             job_detail.get("PubId")
                             or job_summary.get("PubId")
                             or ""
                         )
-                        # Fall back to parsing from location code e.g. JDW-5779-22 -> 5779
                         if not pub_id:
                             location = (
                                 job_detail.get("Location", "")
@@ -453,9 +428,9 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
 
                         if pub_id:
                             if pub_id not in pub_postcode_cache:
-                                postcode = client.get_pub_postcode(pub_id)
+                                postcode = await client.get_pub_postcode(pub_id)
                                 pub_postcode_cache[pub_id] = postcode
-                                time.sleep(0.1)
+                                await asyncio.sleep(0.1)
                             else:
                                 postcode = pub_postcode_cache[pub_id]
                             if postcode:
@@ -468,9 +443,7 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
                     log.warning(f"Could not fetch detail for job {job_id}: {e}")
                     job_detail = job_summary
 
-                is_new, is_updated = upsert_job(
-                    cur, job_detail, tab, item, label, fixed_desc
-                )
+                is_new, is_updated = upsert_job(cur, job_detail, tab, item, label, fixed_desc)
                 if is_new:
                     jobs_new += 1
                 elif is_updated:
@@ -500,13 +473,8 @@ def sync_target(client: WisdomClient, target: tuple, conn, cur):
         log.error(f"  ✗ {label}: {e}")
 
 
-def backfill_postcodes(client, conn, cur):
-    """
-    Backfill postcodes for all jobs that are missing them.
-    Runs at the start of every sync cycle.
-    Uses a RealDictCursor explicitly to avoid tuple/dict access errors.
-    """
-    # Use a dedicated dict cursor for this function
+async def backfill_postcodes_async(client, conn, cur):
+    """Backfill postcodes for all jobs that are missing them."""
     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     dict_cur.execute(
@@ -522,8 +490,6 @@ def backfill_postcodes(client, conn, cur):
 
     log.info(f"Postcode backfill: {count} jobs missing postcodes. Fetching...")
 
-    # Get distinct pub IDs for jobs missing postcodes
-    # MIV jobs have PubId in raw_json but no location_code, so check both
     dict_cur.execute("""
         SELECT DISTINCT
             CASE
@@ -552,9 +518,9 @@ def backfill_postcodes(client, conn, cur):
             continue
 
         if pub_id not in pub_cache:
-            postcode = client.get_pub_postcode(pub_id)
+            postcode = await client.get_pub_postcode(pub_id)
             pub_cache[pub_id] = postcode
-            time.sleep(0.15)
+            await asyncio.sleep(0.15)
         else:
             postcode = pub_cache[pub_id]
 
@@ -573,39 +539,36 @@ def backfill_postcodes(client, conn, cur):
     )
 
 
-def run_sync():
-    """Run a full sync cycle across all targets."""
+async def run_sync_async():
+    """Run a full sync cycle across all targets — async version."""
     log.info("=" * 60)
     log.info("Wisdom Sync starting...")
     log.info("=" * 60)
 
     client = WisdomClient()
-    client.authenticate()
+    await client.authenticate()
 
     conn = get_db()
     cur = conn.cursor()
 
-    # Backfill postcodes for any jobs missing them
     try:
-        backfill_postcodes(client, conn, cur)
+        await backfill_postcodes_async(client, conn, cur)
     except Exception as e:
         log.error(f"Postcode backfill failed: {e}", exc_info=True)
 
     for target in EXTRACTION_TARGETS:
-        sync_target(client, target, conn, cur)
+        await sync_target_async(client, target, conn, cur)
 
     cur.close()
     conn.close()
 
-    # Close the browser and stop Playwright after all syncs complete
-    try:
-        client._browser.close()
-        client._playwright.stop()
-        log.info("Browser closed.")
-    except Exception:
-        pass
-
+    await client.close()
     log.info("Sync complete.")
+
+
+def run_sync():
+    """Entry point — runs the async sync in a fresh event loop."""
+    asyncio.run(run_sync_async())
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -613,13 +576,11 @@ def run_sync():
 if __name__ == "__main__":
     init_db()
 
-    # Determine run mode
     run_once = os.environ.get("RUN_ONCE", "false").lower() == "true"
 
     if run_once:
         run_sync()
     else:
-        # Scheduled mode: sync every 2 hours
         sync_interval = int(os.environ.get("SYNC_INTERVAL_MINUTES", "120"))
         log.info(f"Running in scheduled mode. Sync every {sync_interval} minutes.")
 
