@@ -539,11 +539,48 @@ async def backfill_postcodes_async(client, conn, cur):
     )
 
 
+async def remove_stale_jobs(conn, cur, sync_started_at):
+    """
+    After a full sync cycle, hard-delete any job that was NOT seen this cycle
+    (last_seen < sync_started_at). Wisdom is the single source of truth —
+    if a job is gone from Wisdom it should be gone from the planner.
+    Also removes any allocations for deleted jobs to keep the grid clean.
+    """
+    try:
+        # First remove allocations for jobs no longer on Wisdom
+        cur.execute("""
+            DELETE FROM allocations
+            WHERE job_id IN (
+                SELECT job_id FROM jobs
+                WHERE last_seen < %s
+            )
+        """, (sync_started_at,))
+        alloc_removed = cur.rowcount
+
+        # Then delete the stale jobs themselves
+        cur.execute("""
+            DELETE FROM jobs
+            WHERE last_seen < %s
+        """, (sync_started_at,))
+        jobs_removed = cur.rowcount
+
+        conn.commit()
+        if jobs_removed:
+            log.info(f"Removed {jobs_removed} job(s) and {alloc_removed} allocation(s) no longer present in Wisdom.")
+        else:
+            log.info("No stale jobs to remove — planner matches Wisdom.")
+    except Exception as e:
+        conn.rollback()
+        log.error(f"Remove stale jobs failed: {e}")
+
+
 async def run_sync_async():
     """Run a full sync cycle across all targets — async version."""
     log.info("=" * 60)
     log.info("Wisdom Sync starting...")
     log.info("=" * 60)
+
+    sync_started_at = datetime.now(timezone.utc)
 
     client = WisdomClient()
     await client.authenticate()
@@ -558,6 +595,9 @@ async def run_sync_async():
 
     for target in EXTRACTION_TARGETS:
         await sync_target_async(client, target, conn, cur)
+
+    # Remove any jobs no longer present in Wisdom
+    await remove_stale_jobs(conn, cur, sync_started_at)
 
     cur.close()
     conn.close()
