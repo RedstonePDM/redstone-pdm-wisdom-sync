@@ -46,9 +46,6 @@ DATABASE_URL    = os.environ["DATABASE_URL"]
 EXTRACTION_TARGETS = [
     ("CALLOUT",       "AWAITINGATTENDANCE", "Callout - Awaiting Attendance",        None),
     ("QUOTEREQUEST",  "AWAITINGSUBMISSION", "Quote Request - Awaiting Submission",   None),
-    ("QUOTEREQUEST",  "QUERIED",            "Quote Request - Queried",               None),
-    ("QUOTEREQUEST",  "AWAITINGAPPROVAL",   "Quote Request - Awaiting Approval",     None),
-    ("QUOTEREQUEST",  "REJECTED",           "Quote Request - Rejected",              None),
     ("QUOTE",         "AWAITINGATTENDANCE", "Quote - Awaiting Attendance",           None),
     ("MIV",           "AWAITINGATTENDANCE", "MIV - Awaiting Attendance",             "MIV Tasks"),
     ("PPM",           "AWAITINGAPPROVAL",   "PPM - Awaiting Approval",               None),
