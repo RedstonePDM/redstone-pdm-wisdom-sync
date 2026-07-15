@@ -792,15 +792,16 @@ async def scrape_job_costs_async(client, conn, cur, max_per_cycle=20, restale_af
     least one submitted job card. Only (re)scrapes jobs we haven't checked
     recently, so this stays light on Wisdom — capped per sync cycle."""
     log.info("Scraping job costs (reactive/PPM billing totals)")
+    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         # job_cards lives in the jobcard app's schema on this same database.
-        cur.execute("""
+        dict_cur.execute("""
             SELECT DISTINCT jc.job_id
             FROM job_cards jc
             WHERE (jc.job_id LIKE '1%%' OR jc.job_id LIKE '2%%' OR jc.job_id LIKE '3%%')
             AND jc.card_date >= NOW() - INTERVAL '90 days'
         """)
-        candidate_ids = [r["job_id"] for r in cur.fetchall()]
+        candidate_ids = [r["job_id"] for r in dict_cur.fetchall()]
     except Exception as e:
         conn.rollback()
         log.warning(f"Could not read job_cards for costs scrape: {e}")
@@ -811,15 +812,15 @@ async def scrape_job_costs_async(client, conn, cur, max_per_cycle=20, restale_af
         if scraped >= max_per_cycle:
             break
 
-        cur.execute("SELECT scraped_at FROM job_wetherspoons_costs WHERE job_id=%s", (job_id,))
-        existing = cur.fetchone()
+        dict_cur.execute("SELECT scraped_at FROM job_wetherspoons_costs WHERE job_id=%s", (job_id,))
+        existing = dict_cur.fetchone()
         if existing:
             age_days = (datetime.now(timezone.utc) - existing["scraped_at"]).days
             if age_days < restale_after_days:
                 continue
 
-        cur.execute("SELECT display_id, job_type FROM jobs WHERE job_id=%s", (job_id,))
-        job_row = cur.fetchone()
+        dict_cur.execute("SELECT display_id, job_type FROM jobs WHERE job_id=%s", (job_id,))
+        job_row = dict_cur.fetchone()
         display_id = job_row["display_id"] if job_row else job_id
         job_type = "ppm" if job_id.startswith("2") else "reactive"
 
@@ -828,7 +829,7 @@ async def scrape_job_costs_async(client, conn, cur, max_per_cycle=20, restale_af
         if result is None:
             continue
 
-        cur.execute("""
+        dict_cur.execute("""
             INSERT INTO job_wetherspoons_costs
                 (job_id, display_id, job_type, total_agreed, visit_count, scraped_at, raw_totals_json)
             VALUES (%s, %s, %s, %s, %s, NOW(), %s)
@@ -842,6 +843,7 @@ async def scrape_job_costs_async(client, conn, cur, max_per_cycle=20, restale_af
         conn.commit()
         scraped += 1
 
+    dict_cur.close()
     log.info(f"Job costs scrape complete: {scraped} job(s) updated this cycle")
 
 
