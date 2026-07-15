@@ -44,11 +44,18 @@ DATABASE_URL    = os.environ["DATABASE_URL"]
 # Tabs and sub-tabs to extract
 # Format: (Tab value, Item value, friendly name, fixed_description or None)
 EXTRACTION_TARGETS = [
-    ("CALLOUT",       "AWAITINGATTENDANCE", "Callout - Awaiting Attendance",        None),
+    ("CALLOUT",       "AWAITINGATTENDANCE", "Callout - Awaiting Attendance",         None),
     ("QUOTEREQUEST",  "AWAITINGSUBMISSION", "Quote Request - Awaiting Submission",   None),
+    ("QUOTEREQUEST",  "AWAITINGAPPROVAL",   "Quote Request - Awaiting Approval",     None),
     ("QUOTE",         "AWAITINGATTENDANCE", "Quote - Awaiting Attendance",           None),
     ("MIV",           "AWAITINGATTENDANCE", "MIV - Awaiting Attendance",             "MIV Tasks"),
     ("PPM",           "AWAITINGAPPROVAL",   "PPM - Awaiting Approval",               None),
+]
+
+# Deep-scrape targets — navigate into each job for outcome reason text
+OUTCOME_TARGETS = [
+    ("QUOTEREQUEST", "REJECTED",      "Quote Request - Rejected"),
+    ("QUOTE",        "CANCELLATIONS", "Quote - Cancellations"),
 ]
 
 PAGE_SIZE = 200  # Fetch up to 200 jobs per tab in one call
@@ -596,6 +603,18 @@ async def run_sync_async():
     # Remove any jobs no longer present in Wisdom
     await remove_stale_jobs(conn, cur, sync_started_at)
 
+    # Scrape rejection and cancellation reasons from Wisdom
+    try:
+        await scrape_outcomes_async(client, conn, cur)
+    except Exception as e:
+        log.error(f"scrape_outcomes_async failed: {e}", exc_info=True)
+
+    # Auto-detect wins from QUOTE > AWAITINGATTENDANCE
+    try:
+        await detect_wins_async(conn, cur)
+    except Exception as e:
+        log.error(f"detect_wins_async failed: {e}", exc_info=True)
+
     cur.close()
     conn.close()
 
@@ -629,3 +648,193 @@ if __name__ == "__main__":
 
             log.info(f"Next sync in {sync_interval} minutes.")
             time.sleep(sync_interval * 60)
+
+
+# ── Outcome Scraping Functions ────────────────────────────────────────────────
+
+async def scrape_outcome_reason(client, job_id, display_id):
+    """Navigate into a rejected/cancelled Wisdom job, click the Quote tab,
+    and extract the outcome reason, heading, and date."""
+    try:
+        job_url = (
+            f"{WISDOM_BASE}/wisdom(bD1lbiZjPTEwMA==)/ContractorPortal#/jobDetail/{job_id}"
+        )
+        log.info(f"Scraping outcome for {display_id or job_id}")
+        await client._page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+        await client._page.wait_for_timeout(2500)
+
+        # Click the Quote tab — try multiple selectors
+        clicked = False
+        for selector in ["text=Quote", "a:has-text('Quote')", "[ng-click*='quote']"]:
+            try:
+                el = await client._page.wait_for_selector(selector, timeout=5000)
+                await el.click()
+                await client._page.wait_for_timeout(1500)
+                clicked = True
+                break
+            except Exception:
+                continue
+
+        if not clicked:
+            log.warning(f"Could not click Quote tab for {job_id}")
+            return {}
+
+        # Extract all visible text and parse heading + reason
+        page_text = await client._page.inner_text("body")
+        lines = [l.strip() for l in page_text.split("\n") if l.strip()]
+
+        heading = ""
+        reason = ""
+        reason_date = ""
+
+        known_headings = [
+            "Reason for Withdrawing this Quote",
+            "Declined Quote",
+            "Cancellation Reason",
+            "Reason for Cancellation",
+            "Reason for Declining",
+        ]
+
+        for i, line in enumerate(lines):
+            # Detect heading
+            for h in known_headings:
+                if h.lower() in line.lower():
+                    heading = h
+                    break
+
+            # After heading or after "Reason" label, capture next non-nav line
+            if (line == "Reason" or (heading and line in [heading])) and i + 1 < len(lines):
+                nav_words = {"General", "Quote", "Notes", "KPIs", "Site Survey",
+                             "Material and Labour Costs", "Request Details"}
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    candidate = lines[j]
+                    if candidate and candidate not in nav_words and len(candidate) > 2:
+                        reason = candidate
+                        break
+
+            # Detect date line
+            if line == "Date" and i + 1 < len(lines):
+                reason_date = lines[i + 1]
+
+        log.info(f"  heading='{heading}' reason='{reason}' date='{reason_date}'")
+        return {"heading": heading, "reason": reason, "date": reason_date}
+
+    except Exception as e:
+        log.warning(f"scrape_outcome_reason failed for {job_id}: {e}")
+        return {}
+
+
+async def scrape_outcomes_async(client, conn, cur):
+    """Scrape rejected and cancelled jobs for outcome reasons, then record them."""
+    for tab, item, label in OUTCOME_TARGETS:
+        log.info(f"Scraping outcomes: {label}")
+        try:
+            results, total = await client.get_job_list(tab, item, skip=0, top=100)
+            log.info(f"  {total} jobs found in {label}")
+
+            for job_summary in results:
+                job_id     = job_summary.get("JobId", "")
+                display_id = job_summary.get("DisplayId", "") or job_id
+                wisdom_status = job_summary.get("StatusText", item)
+                pub_name   = (job_summary.get("PubName") or
+                              job_summary.get("LocationText", ""))
+                trade_type = job_summary.get("TradetypeText", "")
+
+                if not job_id:
+                    continue
+
+                # Skip if already recorded
+                cur.execute(
+                    "SELECT id FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
+                    (job_id, display_id)
+                )
+                if cur.fetchone():
+                    continue
+
+                await asyncio.sleep(0.8)
+                outcome_data = await scrape_outcome_reason(client, job_id, display_id)
+
+                outcome_type = "cancelled" if item == "CANCELLATIONS" else "lost"
+
+                # Match to survey_form
+                cur.execute(
+                    """SELECT id, submitted_at FROM survey_forms
+                       WHERE job_id=%s OR job_id=%s
+                       ORDER BY submitted_at DESC LIMIT 1""",
+                    (job_id, display_id)
+                )
+                sf = cur.fetchone()
+
+                cur.execute(
+                    """INSERT INTO quote_outcomes
+                       (job_id, display_id, survey_form_id, outcome, wisdom_status,
+                        wisdom_reason, reason_heading, reason_date,
+                        pub_name, trade_type, t3_decision, detected_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+                       ON CONFLICT (display_id) DO UPDATE SET
+                           wisdom_status=EXCLUDED.wisdom_status,
+                           wisdom_reason=EXCLUDED.wisdom_reason,
+                           reason_heading=EXCLUDED.reason_heading,
+                           reason_date=EXCLUDED.reason_date,
+                           detected_at=NOW()""",
+                    (job_id, display_id, sf["id"] if sf else None,
+                     outcome_type, wisdom_status,
+                     outcome_data.get("reason", ""),
+                     outcome_data.get("heading", ""),
+                     outcome_data.get("date", ""),
+                     pub_name, trade_type)
+                )
+
+                if sf:
+                    cur.execute(
+                        """UPDATE survey_forms SET status=%s, outcome=%s,
+                           outcome_reason=%s, updated_at=NOW() WHERE id=%s""",
+                        (outcome_type, outcome_type,
+                         outcome_data.get("reason", ""), sf["id"])
+                    )
+
+                conn.commit()
+                log.info(f"  Recorded {outcome_type}: {display_id} — "
+                         f"{outcome_data.get('reason','(no reason)')}")
+
+        except Exception as e:
+            conn.rollback()
+            log.error(f"scrape_outcomes_async failed for {label}: {e}", exc_info=True)
+
+
+async def detect_wins_async(conn, cur):
+    """Auto-detect wins: survey job appearing in QUOTE tab means JDW approved it."""
+    try:
+        cur.execute(
+            """SELECT sf.id, sf.job_id, j.display_id, j.pub_name, j.trade_type,
+                      j.date_released
+               FROM survey_forms sf
+               JOIN jobs j ON (j.job_id=sf.job_id OR j.display_id=sf.job_id)
+               WHERE j.tab='QUOTE'
+               AND sf.status NOT IN ('won','cancelled')"""
+        )
+        wins = cur.fetchall()
+        for w in wins:
+            cur.execute(
+                """UPDATE survey_forms SET status='won', outcome='won',
+                   updated_at=NOW() WHERE id=%s""",
+                (w["id"],)
+            )
+            cur.execute(
+                """INSERT INTO quote_outcomes
+                   (job_id, display_id, survey_form_id, outcome, wisdom_status,
+                    pub_name, trade_type, t3_decision, detected_at)
+                   VALUES (%s,%s,%s,'won','Approved',%s,%s,NOW(),NOW())
+                   ON CONFLICT (display_id) DO NOTHING""",
+                (w["job_id"], w["display_id"] or w["job_id"], w["id"],
+                 w["pub_name"], w["trade_type"])
+            )
+            log.info(f"  WIN detected: {w['display_id'] or w['job_id']}")
+        conn.commit()
+        if wins:
+            log.info(f"Detected {len(wins)} win(s)")
+        else:
+            log.info("No new wins detected")
+    except Exception as e:
+        conn.rollback()
+        log.error(f"detect_wins_async failed: {e}", exc_info=True)
