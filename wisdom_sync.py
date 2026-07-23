@@ -124,11 +124,28 @@ def init_db():
             job_type        TEXT,
             total_agreed    NUMERIC(10,2),
             visit_count     INTEGER,
+            status          TEXT,
+            payment_date    DATE,
             scraped_at      TIMESTAMPTZ DEFAULT NOW(),
             raw_totals_json JSONB
         );
     """)
     conn.commit()
+
+    # These two columns were added after the table already existed in
+    # production — CREATE TABLE IF NOT EXISTS above won't retrofit them onto
+    # an existing table, so add them explicitly and tolerate them already
+    # being there.
+    for col_sql in [
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS status TEXT",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS payment_date DATE",
+    ]:
+        try:
+            cur.execute(col_sql)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
     cur.close()
     conn.close()
     log.info("Database initialised.")
@@ -627,9 +644,9 @@ async def run_sync_async():
 
     # Scrape agreed Wetherspoons totals for reactive/PPM jobs (billing/margin)
     try:
-        await scrape_job_costs_async(client, conn, cur)
+        await scrape_admin_payment_costs_async(client, conn, cur)
     except Exception as e:
-        log.error(f"scrape_job_costs_async failed: {e}", exc_info=True)
+        log.error(f"scrape_admin_payment_costs_async failed: {e}", exc_info=True)
 
     cur.close()
     conn.close()
@@ -740,111 +757,75 @@ async def scrape_outcome_reason(client, job_id, display_id):
         return {}
 
 
-async def scrape_job_costs(client, job_id, display_id):
-    """Navigate into a reactive (1000/3000) or PPM (2000) job and read the
-    'Material and Labour Costs' tab. Sums the 'Total Cost £ X' figure shown
-    on each day panel — this already includes callout/revisit fee, labour,
-    and materials combined, so it's the real Wetherspoons-agreed total for
-    that job without us having to reimplement the callout/revisit fee logic
-    ourselves. Returns None if the tab can't be read (never guesses)."""
-    try:
-        job_url = (
-            f"{WISDOM_BASE}/wisdom(bD1lbiZjPTEwMA==)/ContractorPortal#/jobDetail/{job_id}"
-        )
-        await client._page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
-        await client._page.wait_for_timeout(2500)
-
-        clicked = False
-        for selector in ["text=Material and Labour Costs",
-                          "a:has-text('Material and Labour Costs')",
-                          "[ng-click*='Cost']"]:
-            try:
-                el = await client._page.wait_for_selector(selector, timeout=5000)
-                await el.click()
-                await client._page.wait_for_timeout(1500)
-                clicked = True
-                break
-            except Exception:
-                continue
-
-        if not clicked:
-            log.warning(f"Could not click Costs tab for {job_id}")
-            return None
-
-        page_text = await client._page.inner_text("body")
-        totals = re.findall(r"Total Cost\s*£\s*([\d,]+\.\d{2})", page_text)
-        if not totals:
-            log.warning(f"No 'Total Cost' figures found on Costs tab for {job_id}")
-            return None
-
-        values = [float(t.replace(",", "")) for t in totals]
-        total_agreed = round(sum(values), 2)
-        log.info(f"  {display_id or job_id}: {len(values)} day(s), total £{total_agreed}")
-        return {"total_agreed": total_agreed, "visit_count": len(values), "raw_totals": values}
-
-    except Exception as e:
-        log.warning(f"scrape_job_costs failed for {job_id}: {e}")
-        return None
-
-
-async def scrape_job_costs_async(client, conn, cur, max_per_cycle=20, restale_after_days=3):
-    """Scrape the agreed Wetherspoons total for reactive/PPM jobs that have at
-    least one submitted job card. Only (re)scrapes jobs we haven't checked
-    recently, so this stays light on Wisdom — capped per sync cycle."""
-    log.info("Scraping job costs (reactive/PPM billing totals)")
+async def scrape_admin_payment_costs_async(client, conn, cur):
+    """Pull ADMIN > With Contractor > Ready for Payment. Wisdom blends Ready
+    For Payment and Approved to Invoice jobs together in this one feed (each
+    row's StatusText tells you which), and every row already carries the
+    agreed TotalCost — covering Callout, PPM, and Quote job types in one go.
+    This replaces navigating into individual jobs entirely: one bulk
+    read-only pull instead of clicking into each job one at a time."""
+    log.info("Scraping ADMIN payment list (job costs / margin baseline)")
     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    tab, item = "ADMIN", "READYFORPAYMENT"
+
+    all_results = []
+    skip = 0
     try:
-        # job_cards lives in the jobcard app's schema on this same database.
-        dict_cur.execute("""
-            SELECT DISTINCT jc.job_id
-            FROM job_cards jc
-            WHERE (jc.job_id LIKE '1%%' OR jc.job_id LIKE '2%%' OR jc.job_id LIKE '3%%')
-            AND jc.card_date >= NOW() - INTERVAL '90 days'
-        """)
-        candidate_ids = [r["job_id"] for r in dict_cur.fetchall()]
+        while True:
+            results, total = await client.get_job_list(tab, item, skip=skip, top=PAGE_SIZE)
+            all_results.extend(results)
+            skip += len(results)
+            if not results or skip >= total:
+                break
     except Exception as e:
-        conn.rollback()
-        log.warning(f"Could not read job_cards for costs scrape: {e}")
+        log.error(f"Failed to fetch ADMIN payment list: {e}")
+        dict_cur.close()
         return
 
-    scraped = 0
-    for job_id in candidate_ids:
-        if scraped >= max_per_cycle:
-            break
-
-        dict_cur.execute("SELECT scraped_at FROM job_wetherspoons_costs WHERE job_id=%s", (job_id,))
-        existing = dict_cur.fetchone()
-        if existing:
-            age_days = (datetime.now(timezone.utc) - existing["scraped_at"]).days
-            if age_days < restale_after_days:
-                continue
-
-        dict_cur.execute("SELECT display_id, job_type FROM jobs WHERE job_id=%s", (job_id,))
-        job_row = dict_cur.fetchone()
-        display_id = job_row["display_id"] if job_row else job_id
-        job_type = "ppm" if job_id.startswith("2") else "reactive"
-
-        await asyncio.sleep(0.8)
-        result = await scrape_job_costs(client, job_id, display_id)
-        if result is None:
+    updated = 0
+    for r in all_results:
+        job_id = r.get("WISDOMId")
+        if not job_id:
             continue
+        display_id = r.get("DisplayId") or job_id
+        status_text = (r.get("StatusText") or "").strip()
+        status = "approved_to_invoice" if "approved" in status_text.lower() else "ready_for_payment"
+
+        job_type_text = (r.get("JobTypeText") or "").lower()
+        if "ppm" in job_type_text:
+            job_type = "ppm"
+        elif "quote" in job_type_text:
+            job_type = "quoted"
+        else:
+            job_type = "reactive"
+
+        try:
+            total_cost = float(r.get("TotalCost") or 0)
+        except (TypeError, ValueError):
+            total_cost = 0.0
+
+        payment_date = r.get("PaymentDate") or None
 
         dict_cur.execute("""
             INSERT INTO job_wetherspoons_costs
-                (job_id, display_id, job_type, total_agreed, visit_count, scraped_at, raw_totals_json)
-            VALUES (%s, %s, %s, %s, %s, NOW(), %s)
+                (job_id, display_id, job_type, total_agreed, status, payment_date, scraped_at, raw_totals_json)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
             ON CONFLICT (job_id) DO UPDATE SET
+                display_id=EXCLUDED.display_id,
+                job_type=EXCLUDED.job_type,
                 total_agreed=EXCLUDED.total_agreed,
-                visit_count=EXCLUDED.visit_count,
+                status=EXCLUDED.status,
+                payment_date=EXCLUDED.payment_date,
                 scraped_at=NOW(),
                 raw_totals_json=EXCLUDED.raw_totals_json
-        """, (job_id, display_id, job_type, result["total_agreed"],
-              result["visit_count"], psycopg2.extras.Json(result["raw_totals"])))
-        conn.commit()
-        scraped += 1
+        """, (job_id, display_id, job_type, total_cost, status,
+              payment_date if payment_date else None,
+              psycopg2.extras.Json(r)))
+        updated += 1
 
+    conn.commit()
     dict_cur.close()
-    log.info(f"Job costs scrape complete: {scraped} job(s) updated this cycle")
+    log.info(f"ADMIN payment costs scrape complete: {updated} job(s) updated")
 
 
 async def scrape_outcomes_async(client, conn, cur):
