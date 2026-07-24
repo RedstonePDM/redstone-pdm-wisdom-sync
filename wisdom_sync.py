@@ -139,6 +139,8 @@ def init_db():
     for col_sql in [
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS status TEXT",
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS payment_date DATE",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS pub_name TEXT",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS trade_type TEXT",
     ]:
         try:
             cur.execute(col_sql)
@@ -811,21 +813,27 @@ async def scrape_admin_payment_costs_async(client, conn, cur):
             total_cost = 0.0
 
         payment_date = r.get("PaymentDate") or None
+        pub_name = r.get("PubName") or None
+        trade_type = r.get("SubtradetypeText") or None
 
         dict_cur.execute("""
             INSERT INTO job_wetherspoons_costs
-                (job_id, display_id, job_type, total_agreed, status, payment_date, scraped_at, raw_totals_json)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
+                (job_id, display_id, job_type, total_agreed, status, payment_date,
+                 pub_name, trade_type, scraped_at, raw_totals_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             ON CONFLICT (job_id) DO UPDATE SET
                 display_id=EXCLUDED.display_id,
                 job_type=EXCLUDED.job_type,
                 total_agreed=EXCLUDED.total_agreed,
                 status=EXCLUDED.status,
                 payment_date=EXCLUDED.payment_date,
+                pub_name=EXCLUDED.pub_name,
+                trade_type=EXCLUDED.trade_type,
                 scraped_at=NOW(),
                 raw_totals_json=EXCLUDED.raw_totals_json
         """, (job_id, display_id, job_type, total_cost, status,
               payment_date if payment_date else None,
+              pub_name, trade_type,
               psycopg2.extras.Json(r)))
         updated += 1
 
