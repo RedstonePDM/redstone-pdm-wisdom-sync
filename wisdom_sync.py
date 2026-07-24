@@ -784,10 +784,16 @@ async def scrape_admin_payment_costs_async(client, conn, cur):
 
     updated = 0
     for r in all_results:
-        job_id = r.get("WISDOMId")
-        if not job_id:
+        wisdom_internal_id = r.get("WISDOMId")
+        if not wisdom_internal_id:
             continue
-        display_id = r.get("DisplayId") or job_id
+        # Quoted (5000-series) jobs have a dual-ID quirk in Wisdom: the
+        # internal WISDOMId can start with 8 while the customer-facing
+        # DisplayId starts with 5 for the same job. Every other table in
+        # this platform (job_cards, survey_forms) keys off DisplayId, so we
+        # do the same here rather than storing the internal 8-prefixed id.
+        job_id = r.get("DisplayId") or wisdom_internal_id
+        display_id = job_id
         status_text = (r.get("StatusText") or "").strip()
         status = "approved_to_invoice" if "approved" in status_text.lower() else "ready_for_payment"
 
