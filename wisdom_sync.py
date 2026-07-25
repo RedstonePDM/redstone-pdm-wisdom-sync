@@ -815,78 +815,104 @@ async def scrape_pipeline_stage_async(client, conn, cur, tab, item, default_stat
         dict_cur.close()
         return 0
 
+    # Load every existing status for jobs we already know about in ONE query
+    # up front, rather than a SELECT-then-INSERT round trip per row — for a
+    # few thousand rows that difference is thousands of extra network calls.
+    try:
+        dict_cur.execute("SELECT job_id, status FROM job_wetherspoons_costs")
+        known_statuses = {r["job_id"]: r["status"] for r in dict_cur.fetchall()}
+    except Exception as e:
+        log.error(f"Could not preload known statuses for {tab}/{item}: {e}")
+        conn.rollback()
+        known_statuses = {}
+
     updated = 0
-    for r in all_results:
-        wisdom_internal_id = r.get("WISDOMId")
-        if not wisdom_internal_id:
-            continue
-        # Quoted (5000-series) jobs have a dual-ID quirk in Wisdom: the
-        # internal WISDOMId can start with 8 while the customer-facing
-        # DisplayId starts with 5 for the same job. Every other table in
-        # this platform keys off DisplayId, so we do the same here.
-        job_id = r.get("DisplayId") or wisdom_internal_id
-        display_id = job_id
-
-        if default_status:
-            status = default_status
-        else:
-            status_text = (r.get("StatusText") or "").strip().lower()
-            status = "approved_to_invoice" if "approved" in status_text else "ready_for_payment"
-
-        job_type_text = (r.get("JobTypeText") or "").lower()
-        if "ppm" in job_type_text:
-            job_type = "ppm"
-        elif "quote" in job_type_text:
-            job_type = "quoted"
-        else:
-            job_type = "reactive"
-
+    BATCH_SIZE = 100
+    for i, r in enumerate(all_results, 1):
         try:
-            total_cost = float(r.get("TotalCost") or 0)
-        except (TypeError, ValueError):
-            total_cost = 0.0
+            wisdom_internal_id = r.get("WISDOMId")
+            if not wisdom_internal_id:
+                continue
+            # Quoted (5000-series) jobs have a dual-ID quirk in Wisdom: the
+            # internal WISDOMId can start with 8 while the customer-facing
+            # DisplayId starts with 5 for the same job. Every other table in
+            # this platform keys off DisplayId, so we do the same here.
+            job_id = r.get("DisplayId") or wisdom_internal_id
+            display_id = job_id
 
-        payment_date = _parse_wisdom_date(r.get("PaymentDate"))
-        due_date = _parse_wisdom_date(r.get("DueDate"))
-        wisdom_status_change_date = _parse_wisdom_date(r.get("StatusChangeDate"))
-        pub_name = r.get("PubName") or None
-        pub_id = r.get("PubId") or None
-        trade_type = r.get("SubtradetypeText") or None
+            if default_status:
+                status = default_status
+            else:
+                status_text = (r.get("StatusText") or "").strip().lower()
+                status = "approved_to_invoice" if "approved" in status_text else "ready_for_payment"
 
-        # Log a status-history entry only when this is new information —
-        # either we've never seen this job, or its status has changed since
-        # the last time we scraped it.
-        dict_cur.execute("SELECT status FROM job_wetherspoons_costs WHERE job_id=%s", (job_id,))
-        existing = dict_cur.fetchone()
-        if not existing or existing["status"] != status:
+            job_type_text = (r.get("JobTypeText") or "").lower()
+            if "ppm" in job_type_text:
+                job_type = "ppm"
+            elif "quote" in job_type_text:
+                job_type = "quoted"
+            else:
+                job_type = "reactive"
+
+            try:
+                total_cost = float(r.get("TotalCost") or 0)
+            except (TypeError, ValueError):
+                total_cost = 0.0
+
+            payment_date = _parse_wisdom_date(r.get("PaymentDate"))
+            due_date = _parse_wisdom_date(r.get("DueDate"))
+            wisdom_status_change_date = _parse_wisdom_date(r.get("StatusChangeDate"))
+            pub_name = r.get("PubName") or None
+            pub_id = r.get("PubId") or None
+            trade_type = r.get("SubtradetypeText") or None
+
+            # Status-history entry only when this is new information —
+            # either we've never seen this job, or its status has changed.
+            if known_statuses.get(job_id) != status:
+                dict_cur.execute("""
+                    INSERT INTO job_status_history (job_id, status, wisdom_status_change_date)
+                    VALUES (%s, %s, %s)
+                """, (job_id, status, wisdom_status_change_date))
+                known_statuses[job_id] = status
+
             dict_cur.execute("""
-                INSERT INTO job_status_history (job_id, status, wisdom_status_change_date)
-                VALUES (%s, %s, %s)
-            """, (job_id, status, wisdom_status_change_date))
+                INSERT INTO job_wetherspoons_costs
+                    (job_id, display_id, job_type, total_agreed, status, payment_date,
+                     pub_name, pub_id, trade_type, wisdom_status_change_date, due_date,
+                     first_seen_at, scraped_at, raw_totals_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
+                ON CONFLICT (job_id) DO UPDATE SET
+                    display_id=EXCLUDED.display_id,
+                    job_type=EXCLUDED.job_type,
+                    total_agreed=EXCLUDED.total_agreed,
+                    status=EXCLUDED.status,
+                    payment_date=EXCLUDED.payment_date,
+                    pub_name=EXCLUDED.pub_name,
+                    pub_id=EXCLUDED.pub_id,
+                    trade_type=EXCLUDED.trade_type,
+                    wisdom_status_change_date=EXCLUDED.wisdom_status_change_date,
+                    due_date=EXCLUDED.due_date,
+                    scraped_at=NOW(),
+                    raw_totals_json=EXCLUDED.raw_totals_json
+            """, (job_id, display_id, job_type, total_cost, status, payment_date,
+                  pub_name, pub_id, trade_type, wisdom_status_change_date, due_date,
+                  psycopg2.extras.Json(r)))
+            updated += 1
 
-        dict_cur.execute("""
-            INSERT INTO job_wetherspoons_costs
-                (job_id, display_id, job_type, total_agreed, status, payment_date,
-                 pub_name, pub_id, trade_type, wisdom_status_change_date, due_date,
-                 first_seen_at, scraped_at, raw_totals_json)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
-            ON CONFLICT (job_id) DO UPDATE SET
-                display_id=EXCLUDED.display_id,
-                job_type=EXCLUDED.job_type,
-                total_agreed=EXCLUDED.total_agreed,
-                status=EXCLUDED.status,
-                payment_date=EXCLUDED.payment_date,
-                pub_name=EXCLUDED.pub_name,
-                pub_id=EXCLUDED.pub_id,
-                trade_type=EXCLUDED.trade_type,
-                wisdom_status_change_date=EXCLUDED.wisdom_status_change_date,
-                due_date=EXCLUDED.due_date,
-                scraped_at=NOW(),
-                raw_totals_json=EXCLUDED.raw_totals_json
-        """, (job_id, display_id, job_type, total_cost, status, payment_date,
-              pub_name, pub_id, trade_type, wisdom_status_change_date, due_date,
-              psycopg2.extras.Json(r)))
-        updated += 1
+        except Exception as row_err:
+            # One bad row (odd date format, weird characters, whatever)
+            # should never silently hang or kill the whole batch — log it,
+            # roll back just this row, and keep going.
+            log.warning(f"Skipped one row in {tab}/{item}: {row_err}")
+            conn.rollback()
+            continue
+
+        # Commit in batches rather than one giant transaction for the whole
+        # feed — keeps each transaction short, and means progress is
+        # actually visible (and safe) if this gets interrupted partway.
+        if i % BATCH_SIZE == 0:
+            conn.commit()
+            log.info(f"  {tab}/{item}: {i} of {len(all_results)} processed...")
 
     conn.commit()
     dict_cur.close()
