@@ -793,27 +793,19 @@ def _parse_wisdom_date(value):
 
 
 async def scrape_pipeline_stage_async(client, conn, cur, tab, item, default_status):
-    """Pull one Wisdom pipeline tab/item in full and upsert every row into
-    job_wetherspoons_costs, logging a status-history entry whenever a job's
-    status has changed since we last saw it. This is the single source of
-    truth for where every job actually sits in Redstone's billing pipeline
-    with Wetherspoons — Awaiting Costs, Ready for Payment, Approved to
-    Invoice, Invoiced, or Paid."""
-    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    """Pull one Wisdom pipeline tab/item page by page and upsert each page
+    into job_wetherspoons_costs as soon as it's fetched, logging a
+    status-history entry whenever a job's status has changed since we last
+    saw it. This is the single source of truth for where every job actually
+    sits in Redstone's billing pipeline with Wetherspoons — Awaiting Costs,
+    Ready for Payment, Approved to Invoice, Invoiced, or Paid.
 
-    all_results = []
-    skip = 0
-    try:
-        while True:
-            results, total = await client.get_job_list(tab, item, skip=skip, top=PAGE_SIZE)
-            all_results.extend(results)
-            skip += len(results)
-            if not results or skip >= total:
-                break
-    except Exception as e:
-        log.error(f"Failed to fetch {tab}/{item}: {e}")
-        dict_cur.close()
-        return 0
+    Rows are saved page-by-page (not all-at-the-end) so that if a page fetch
+    fails partway through a large feed (e.g. a network blip), everything
+    fetched so far is already safely committed to the database — nothing
+    fetched is ever thrown away, and a re-run only has to pick up from
+    wherever it left off."""
+    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     # Load every existing status for jobs we already know about in ONE query
     # up front, rather than a SELECT-then-INSERT round trip per row — for a
@@ -827,12 +819,51 @@ async def scrape_pipeline_stage_async(client, conn, cur, tab, item, default_stat
         known_statuses = {}
 
     updated = 0
-    BATCH_SIZE = 100
-    for i, r in enumerate(all_results, 1):
+    fetched_count = 0
+    skip = 0
+    total = None
+
+    while True:
         try:
+            results, total = await client.get_job_list(tab, item, skip=skip, top=PAGE_SIZE)
+        except Exception as e:
+            log.error(
+                f"Failed to fetch {tab}/{item} at skip={skip} "
+                f"(after successfully saving {updated} of {fetched_count} fetched so far): {e}"
+            )
+            break
+
+        if not results:
+            break
+
+        fetched_count += len(results)
+
+        for r in results:
+            _upsert_pipeline_row(dict_cur, conn, known_statuses, tab, item, r, default_status)
+            updated += 1
+
+        # Commit after every page rather than one giant transaction for the
+        # whole feed — keeps each transaction short, and means progress is
+        # actually saved (not just logged) if this gets interrupted partway.
+        conn.commit()
+        log.info(f"  {tab}/{item}: {fetched_count} of {total} fetched, {updated} saved...")
+
+        skip += len(results)
+        if skip >= total:
+            break
+
+    dict_cur.close()
+    return updated
+
+
+def _upsert_pipeline_row(dict_cur, conn, known_statuses, tab, item, r, default_status):
+    """Upsert a single Wisdom pipeline row. Isolated so one bad row (odd
+    date format, weird characters, whatever) never silently hangs or kills
+    the rest of the page — log it, roll back just this row, and keep going."""
+    try:
             wisdom_internal_id = r.get("WISDOMId")
             if not wisdom_internal_id:
-                continue
+                return
             # Quoted (5000-series) jobs have a dual-ID quirk in Wisdom: the
             # internal WISDOMId can start with 8 while the customer-facing
             # DisplayId starts with 5 for the same job. Every other table in
@@ -897,26 +928,13 @@ async def scrape_pipeline_stage_async(client, conn, cur, tab, item, default_stat
             """, (job_id, display_id, job_type, total_cost, status, payment_date,
                   pub_name, pub_id, trade_type, wisdom_status_change_date, due_date,
                   psycopg2.extras.Json(r)))
-            updated += 1
 
-        except Exception as row_err:
-            # One bad row (odd date format, weird characters, whatever)
-            # should never silently hang or kill the whole batch — log it,
-            # roll back just this row, and keep going.
-            log.warning(f"Skipped one row in {tab}/{item}: {row_err}")
-            conn.rollback()
-            continue
-
-        # Commit in batches rather than one giant transaction for the whole
-        # feed — keeps each transaction short, and means progress is
-        # actually visible (and safe) if this gets interrupted partway.
-        if i % BATCH_SIZE == 0:
-            conn.commit()
-            log.info(f"  {tab}/{item}: {i} of {len(all_results)} processed...")
-
-    conn.commit()
-    dict_cur.close()
-    return updated
+    except Exception as row_err:
+        # One bad row (odd date format, weird characters, whatever) should
+        # never silently hang or kill the rest of the page — log it, roll
+        # back just this row, and let the caller move on to the next one.
+        log.warning(f"Skipped one row in {tab}/{item}: {row_err}")
+        conn.rollback()
 
 
 async def scrape_all_pipeline_stages_async(client, conn, cur):
