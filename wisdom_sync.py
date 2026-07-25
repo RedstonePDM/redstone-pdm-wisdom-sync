@@ -597,38 +597,82 @@ async def backfill_postcodes_async(client, conn, cur):
     )
 
 
+async def backfill_wisdom_pub_postcodes_async(client, conn, cur):
+    """Backfill postcodes into pub_locations, sourced from
+    job_wetherspoons_costs (pub_id + pub_name) rather than the 'jobs' table.
+
+    This matters: 'jobs' only holds currently-active jobs — once a job is
+    Paid, its row is deleted from 'jobs' to keep the live board clean. So a
+    pub whose most recent job has already been paid off has NO row left in
+    'jobs' to pull a postcode from, even though it's sat there permanently
+    in job_wetherspoons_costs. That was the root cause of most pubs showing
+    no postcode on the Paid Jobs page. Sourcing from job_wetherspoons_costs
+    instead — which never gets rows deleted — fixes this for good, and
+    covers every pub that's ever appeared anywhere in the billing pipeline,
+    not just ones with something live right now."""
+    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    dict_cur.execute("""
+        SELECT DISTINCT pub_id, pub_name FROM job_wetherspoons_costs
+        WHERE pub_id IS NOT NULL AND pub_id != ''
+          AND pub_name IS NOT NULL AND pub_name != ''
+    """)
+    wisdom_pubs = dict_cur.fetchall()
+
+    dict_cur.execute("SELECT pub_name FROM pub_locations WHERE postcode IS NOT NULL AND postcode != ''")
+    already_have = {r["pub_name"] for r in dict_cur.fetchall()}
+    dict_cur.close()
+
+    to_fetch = [(r["pub_id"], r["pub_name"]) for r in wisdom_pubs if r["pub_name"] not in already_have]
+
+    if not to_fetch:
+        log.info("Wisdom pub postcode backfill: all known pubs already have a postcode.")
+        return
+
+    log.info(f"Wisdom pub postcode backfill: {len(to_fetch)} pub(s) missing a postcode. Fetching...")
+
+    fetched = 0
+    for pub_id, pub_name in to_fetch:
+        postcode = await client.get_pub_postcode(pub_id)
+        await asyncio.sleep(0.15)
+        if not postcode:
+            continue
+        cur.execute("""
+            INSERT INTO pub_locations (pub_name, postcode)
+            VALUES (%s, %s)
+            ON CONFLICT (pub_name) DO UPDATE SET
+                postcode = EXCLUDED.postcode,
+                latitude = CASE WHEN pub_locations.postcode = EXCLUDED.postcode THEN pub_locations.latitude ELSE NULL END,
+                longitude = CASE WHEN pub_locations.postcode = EXCLUDED.postcode THEN pub_locations.longitude ELSE NULL END,
+                geocode_failed = CASE WHEN pub_locations.postcode = EXCLUDED.postcode THEN pub_locations.geocode_failed ELSE FALSE END
+        """, (pub_name, postcode))
+        fetched += 1
+
+    conn.commit()
+    log.info(f"Wisdom pub postcode backfill complete: {fetched} of {len(to_fetch)} pub(s) got a postcode.")
+
+
 def geocode_pub_locations(conn, cur):
     """Turn pub postcodes into lat/lng coordinates via postcodes.io (free,
     no API key, no rate limit for reasonable use) — foundation for the
-    recruitment coverage map. Only geocodes pubs that are new or whose
-    postcode has changed since we last looked it up; already-geocoded pubs
-    with an unchanged postcode are skipped, so this stays cheap on every
-    sync run rather than re-fetching the same coordinates repeatedly.
+    recruitment coverage map. Sources postcodes directly from pub_locations
+    itself (populated by backfill_wisdom_pub_postcodes_async), so this only
+    ever geocodes a pub once — not re-fetched on every sync — unless its
+    postcode has genuinely changed (which resets latitude to NULL, picked
+    up here automatically).
 
     This is a plain internet call via `requests`, NOT through the Wisdom
     Playwright browser session — postcodes.io is a public, unrelated
     service, so it doesn't need Wisdom's session cookies at all."""
     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # One postcode per pub — most recent non-blank postcode seen for that
-    # pub name across every job we've captured.
     dict_cur.execute("""
-        SELECT pub_name, MAX(postcode) as postcode
-        FROM jobs
-        WHERE pub_name IS NOT NULL AND pub_name != ''
-          AND postcode IS NOT NULL AND postcode != ''
-        GROUP BY pub_name
+        SELECT pub_name, postcode FROM pub_locations
+        WHERE postcode IS NOT NULL AND postcode != ''
+          AND latitude IS NULL AND geocode_failed = FALSE
     """)
-    pub_postcodes = {r["pub_name"]: r["postcode"] for r in dict_cur.fetchall()}
-
-    dict_cur.execute("SELECT pub_name, postcode FROM pub_locations")
-    already_geocoded = {r["pub_name"]: r["postcode"] for r in dict_cur.fetchall()}
+    to_geocode = {r["pub_name"]: r["postcode"] for r in dict_cur.fetchall()}
     dict_cur.close()
-
-    to_geocode = {
-        pub: postcode for pub, postcode in pub_postcodes.items()
-        if already_geocoded.get(pub) != postcode
-    }
 
     if not to_geocode:
         log.info("Geocoding: all pub locations already up to date.")
@@ -738,6 +782,11 @@ async def run_sync_async():
         await backfill_postcodes_async(client, conn, cur)
     except Exception as e:
         log.error(f"Postcode backfill failed: {e}", exc_info=True)
+
+    try:
+        await backfill_wisdom_pub_postcodes_async(client, conn, cur)
+    except Exception as e:
+        log.error(f"Wisdom pub postcode backfill failed: {e}", exc_info=True)
 
     try:
         geocode_pub_locations(conn, cur)
