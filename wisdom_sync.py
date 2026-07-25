@@ -153,6 +153,19 @@ def init_db():
             detected_at TIMESTAMPTZ DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS idx_job_status_history_job_id ON job_status_history(job_id)",
+        # Geocoded pub locations — foundation for the recruitment coverage
+        # map. Keyed by pub_name (matches how pubs are already grouped
+        # everywhere else in the platform). One row per pub, refreshed only
+        # when its postcode changes, so this stays a cheap lookup rather
+        # than a per-job geocode call.
+        """CREATE TABLE IF NOT EXISTS pub_locations (
+            pub_name     TEXT PRIMARY KEY,
+            postcode     TEXT,
+            latitude     NUMERIC(9,6),
+            longitude    NUMERIC(9,6),
+            geocoded_at  TIMESTAMPTZ,
+            geocode_failed BOOLEAN DEFAULT FALSE
+        )""",
     ]:
         try:
             cur.execute(col_sql)
@@ -584,6 +597,94 @@ async def backfill_postcodes_async(client, conn, cur):
     )
 
 
+def geocode_pub_locations(conn, cur):
+    """Turn pub postcodes into lat/lng coordinates via postcodes.io (free,
+    no API key, no rate limit for reasonable use) — foundation for the
+    recruitment coverage map. Only geocodes pubs that are new or whose
+    postcode has changed since we last looked it up; already-geocoded pubs
+    with an unchanged postcode are skipped, so this stays cheap on every
+    sync run rather than re-fetching the same coordinates repeatedly.
+
+    This is a plain internet call via `requests`, NOT through the Wisdom
+    Playwright browser session — postcodes.io is a public, unrelated
+    service, so it doesn't need Wisdom's session cookies at all."""
+    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # One postcode per pub — most recent non-blank postcode seen for that
+    # pub name across every job we've captured.
+    dict_cur.execute("""
+        SELECT pub_name, MAX(postcode) as postcode
+        FROM jobs
+        WHERE pub_name IS NOT NULL AND pub_name != ''
+          AND postcode IS NOT NULL AND postcode != ''
+        GROUP BY pub_name
+    """)
+    pub_postcodes = {r["pub_name"]: r["postcode"] for r in dict_cur.fetchall()}
+
+    dict_cur.execute("SELECT pub_name, postcode FROM pub_locations")
+    already_geocoded = {r["pub_name"]: r["postcode"] for r in dict_cur.fetchall()}
+    dict_cur.close()
+
+    to_geocode = {
+        pub: postcode for pub, postcode in pub_postcodes.items()
+        if already_geocoded.get(pub) != postcode
+    }
+
+    if not to_geocode:
+        log.info("Geocoding: all pub locations already up to date.")
+        return
+
+    log.info(f"Geocoding: {len(to_geocode)} pub(s) need a fresh lookup.")
+
+    pub_names = list(to_geocode.keys())
+    geocoded = 0
+    failed = 0
+
+    # postcodes.io's bulk endpoint accepts up to 100 postcodes per call.
+    BATCH = 100
+    for i in range(0, len(pub_names), BATCH):
+        batch_pubs = pub_names[i:i + BATCH]
+        batch_postcodes = [to_geocode[p] for p in batch_pubs]
+        try:
+            resp = requests.post(
+                "https://api.postcodes.io/postcodes",
+                json={"postcodes": batch_postcodes},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            results = resp.json().get("result", [])
+        except Exception as e:
+            log.warning(f"Geocoding batch failed (pubs {i}-{i+len(batch_pubs)}): {e}")
+            continue
+
+        for pub, result in zip(batch_pubs, results):
+            postcode = to_geocode[pub]
+            match = result.get("result") if result else None
+            if match and match.get("latitude") is not None:
+                cur.execute("""
+                    INSERT INTO pub_locations (pub_name, postcode, latitude, longitude, geocoded_at, geocode_failed)
+                    VALUES (%s, %s, %s, %s, NOW(), FALSE)
+                    ON CONFLICT (pub_name) DO UPDATE SET
+                        postcode=EXCLUDED.postcode, latitude=EXCLUDED.latitude,
+                        longitude=EXCLUDED.longitude, geocoded_at=NOW(), geocode_failed=FALSE
+                """, (pub, postcode, match["latitude"], match["longitude"]))
+                geocoded += 1
+            else:
+                # Postcode didn't resolve (typo, outdated postcode, etc.) —
+                # record the attempt so we don't keep retrying it every
+                # sync, but flag it so it's easy to find and fix manually.
+                cur.execute("""
+                    INSERT INTO pub_locations (pub_name, postcode, latitude, longitude, geocoded_at, geocode_failed)
+                    VALUES (%s, %s, NULL, NULL, NOW(), TRUE)
+                    ON CONFLICT (pub_name) DO UPDATE SET
+                        postcode=EXCLUDED.postcode, geocoded_at=NOW(), geocode_failed=TRUE
+                """, (pub, postcode))
+                failed += 1
+
+    conn.commit()
+    log.info(f"Geocoding complete: {geocoded} pub(s) geocoded, {failed} failed (bad/unrecognised postcode).")
+
+
 async def remove_stale_jobs(conn, cur, sync_started_at):
     """
     After a full sync cycle, hard-delete any job that was NOT seen this cycle
@@ -637,6 +738,11 @@ async def run_sync_async():
         await backfill_postcodes_async(client, conn, cur)
     except Exception as e:
         log.error(f"Postcode backfill failed: {e}", exc_info=True)
+
+    try:
+        geocode_pub_locations(conn, cur)
+    except Exception as e:
+        log.error(f"Geocoding failed: {e}", exc_info=True)
 
     for target in EXTRACTION_TARGETS:
         await sync_target_async(client, target, conn, cur)
