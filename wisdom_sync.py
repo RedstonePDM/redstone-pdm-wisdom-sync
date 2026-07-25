@@ -141,6 +141,18 @@ def init_db():
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS payment_date DATE",
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS pub_name TEXT",
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS trade_type TEXT",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS pub_id TEXT",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS wisdom_status_change_date DATE",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS due_date DATE",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ DEFAULT NOW()",
+        """CREATE TABLE IF NOT EXISTS job_status_history (
+            id SERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            wisdom_status_change_date DATE,
+            detected_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_job_status_history_job_id ON job_status_history(job_id)",
     ]:
         try:
             cur.execute(col_sql)
@@ -646,9 +658,9 @@ async def run_sync_async():
 
     # Scrape agreed Wetherspoons totals for reactive/PPM jobs (billing/margin)
     try:
-        await scrape_admin_payment_costs_async(client, conn, cur)
+        await scrape_all_pipeline_stages_async(client, conn, cur)
     except Exception as e:
-        log.error(f"scrape_admin_payment_costs_async failed: {e}", exc_info=True)
+        log.error(f"scrape_all_pipeline_stages_async failed: {e}", exc_info=True)
 
     cur.close()
     conn.close()
@@ -759,16 +771,35 @@ async def scrape_outcome_reason(client, job_id, display_id):
         return {}
 
 
-async def scrape_admin_payment_costs_async(client, conn, cur):
-    """Pull ADMIN > With Contractor > Ready for Payment. Wisdom blends Ready
-    For Payment and Approved to Invoice jobs together in this one feed (each
-    row's StatusText tells you which), and every row already carries the
-    agreed TotalCost — covering Callout, PPM, and Quote job types in one go.
-    This replaces navigating into individual jobs entirely: one bulk
-    read-only pull instead of clicking into each job one at a time."""
-    log.info("Scraping ADMIN payment list (job costs / margin baseline)")
+# Each entry: (Tab, Item, default status if a row's own StatusText doesn't
+# tell us otherwise). Ready For Payment blends two real statuses in one feed
+# (Wisdom's own StatusText distinguishes them), everything else is one status.
+PIPELINE_TARGETS = [
+    ("ADMIN",   "AWAITINGCOSTS",   "awaiting_costs"),
+    ("ADMIN",   "READYFORPAYMENT", None),  # status read per-row from StatusText
+    ("PAYMENT", "INVOICED",        "invoiced"),
+    ("PAYMENT", "PAID",            "paid"),
+]
+
+
+def _parse_wisdom_date(value):
+    """Wisdom date fields come back as 'YYYY-MM-DD' strings or blank."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+async def scrape_pipeline_stage_async(client, conn, cur, tab, item, default_status):
+    """Pull one Wisdom pipeline tab/item in full and upsert every row into
+    job_wetherspoons_costs, logging a status-history entry whenever a job's
+    status has changed since we last saw it. This is the single source of
+    truth for where every job actually sits in Redstone's billing pipeline
+    with Wetherspoons — Awaiting Costs, Ready for Payment, Approved to
+    Invoice, Invoiced, or Paid."""
     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    tab, item = "ADMIN", "READYFORPAYMENT"
 
     all_results = []
     skip = 0
@@ -780,9 +811,9 @@ async def scrape_admin_payment_costs_async(client, conn, cur):
             if not results or skip >= total:
                 break
     except Exception as e:
-        log.error(f"Failed to fetch ADMIN payment list: {e}")
+        log.error(f"Failed to fetch {tab}/{item}: {e}")
         dict_cur.close()
-        return
+        return 0
 
     updated = 0
     for r in all_results:
@@ -792,12 +823,15 @@ async def scrape_admin_payment_costs_async(client, conn, cur):
         # Quoted (5000-series) jobs have a dual-ID quirk in Wisdom: the
         # internal WISDOMId can start with 8 while the customer-facing
         # DisplayId starts with 5 for the same job. Every other table in
-        # this platform (job_cards, survey_forms) keys off DisplayId, so we
-        # do the same here rather than storing the internal 8-prefixed id.
+        # this platform keys off DisplayId, so we do the same here.
         job_id = r.get("DisplayId") or wisdom_internal_id
         display_id = job_id
-        status_text = (r.get("StatusText") or "").strip()
-        status = "approved_to_invoice" if "approved" in status_text.lower() else "ready_for_payment"
+
+        if default_status:
+            status = default_status
+        else:
+            status_text = (r.get("StatusText") or "").strip().lower()
+            status = "approved_to_invoice" if "approved" in status_text else "ready_for_payment"
 
         job_type_text = (r.get("JobTypeText") or "").lower()
         if "ppm" in job_type_text:
@@ -812,15 +846,30 @@ async def scrape_admin_payment_costs_async(client, conn, cur):
         except (TypeError, ValueError):
             total_cost = 0.0
 
-        payment_date = r.get("PaymentDate") or None
+        payment_date = _parse_wisdom_date(r.get("PaymentDate"))
+        due_date = _parse_wisdom_date(r.get("DueDate"))
+        wisdom_status_change_date = _parse_wisdom_date(r.get("StatusChangeDate"))
         pub_name = r.get("PubName") or None
+        pub_id = r.get("PubId") or None
         trade_type = r.get("SubtradetypeText") or None
+
+        # Log a status-history entry only when this is new information —
+        # either we've never seen this job, or its status has changed since
+        # the last time we scraped it.
+        dict_cur.execute("SELECT status FROM job_wetherspoons_costs WHERE job_id=%s", (job_id,))
+        existing = dict_cur.fetchone()
+        if not existing or existing["status"] != status:
+            dict_cur.execute("""
+                INSERT INTO job_status_history (job_id, status, wisdom_status_change_date)
+                VALUES (%s, %s, %s)
+            """, (job_id, status, wisdom_status_change_date))
 
         dict_cur.execute("""
             INSERT INTO job_wetherspoons_costs
                 (job_id, display_id, job_type, total_agreed, status, payment_date,
-                 pub_name, trade_type, scraped_at, raw_totals_json)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                 pub_name, pub_id, trade_type, wisdom_status_change_date, due_date,
+                 first_seen_at, scraped_at, raw_totals_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
             ON CONFLICT (job_id) DO UPDATE SET
                 display_id=EXCLUDED.display_id,
                 job_type=EXCLUDED.job_type,
@@ -828,18 +877,32 @@ async def scrape_admin_payment_costs_async(client, conn, cur):
                 status=EXCLUDED.status,
                 payment_date=EXCLUDED.payment_date,
                 pub_name=EXCLUDED.pub_name,
+                pub_id=EXCLUDED.pub_id,
                 trade_type=EXCLUDED.trade_type,
+                wisdom_status_change_date=EXCLUDED.wisdom_status_change_date,
+                due_date=EXCLUDED.due_date,
                 scraped_at=NOW(),
                 raw_totals_json=EXCLUDED.raw_totals_json
-        """, (job_id, display_id, job_type, total_cost, status,
-              payment_date if payment_date else None,
-              pub_name, trade_type,
+        """, (job_id, display_id, job_type, total_cost, status, payment_date,
+              pub_name, pub_id, trade_type, wisdom_status_change_date, due_date,
               psycopg2.extras.Json(r)))
         updated += 1
 
     conn.commit()
     dict_cur.close()
-    log.info(f"ADMIN payment costs scrape complete: {updated} job(s) updated")
+    return updated
+
+
+async def scrape_all_pipeline_stages_async(client, conn, cur):
+    """Run the pipeline scrape across all four Wisdom billing stages."""
+    log.info("Scraping Wisdom billing pipeline (Awaiting Costs / Ready for Payment / Invoiced / Paid)")
+    for tab, item, default_status in PIPELINE_TARGETS:
+        try:
+            updated = await scrape_pipeline_stage_async(client, conn, cur, tab, item, default_status)
+            log.info(f"  {tab}/{item}: {updated} job(s) updated")
+        except Exception as e:
+            log.error(f"Pipeline stage {tab}/{item} failed: {e}", exc_info=True)
+    log.info("Pipeline scrape complete")
 
 
 async def scrape_outcomes_async(client, conn, cur):
