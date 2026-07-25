@@ -390,7 +390,7 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
         "additional_text":  job_data.get("AdditionalText", ""),
         "due_date":         job_data.get("DueDate", ""),
         "due_time":         job_data.get("DueTime", ""),
-        "date_released":    job_data.get("DateReleased", ""),
+        "date_released":    job_data.get("ReleasedDate", ""),
         "contractor_name":  job_data.get("ContractorName", ""),
         "contractor_email": job_data.get("ContractorEmail", ""),
         "contractor_phone": job_data.get("ContractorPhone", ""),
@@ -1163,7 +1163,7 @@ async def backfill_raised_dates_async(client, conn, cur, limit=None):
         try:
             detail = await client.get_job_detail(wisdom_id)
             await asyncio.sleep(0.2)
-            raised = _parse_wisdom_date(detail.get("DateReleased"))
+            raised = _parse_wisdom_date(detail.get("ReleasedDate"))
             if raised:
                 cur.execute("""
                     UPDATE job_wetherspoons_costs
@@ -1189,7 +1189,7 @@ async def backfill_raised_dates_async(client, conn, cur, limit=None):
     conn.commit()
     log.info(
         f"Raised-date backfill complete: {found} found, {blank} blank "
-        f"(genuinely no DateReleased on Wisdom's side), {errored} errored."
+        f"(genuinely no ReleasedDate on Wisdom's side), {errored} errored."
     )
 
 
