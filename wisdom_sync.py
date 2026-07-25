@@ -145,6 +145,14 @@ def init_db():
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS wisdom_status_change_date DATE",
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS due_date DATE",
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ DEFAULT NOW()",
+        # 'Date Released' — the true 'job raised' date, visible on Wisdom's
+        # own job detail screen but NOT present in the PAYMENT/PAID billing
+        # feed we scrape for the pipeline. Needs a separate detail lookup
+        # per job (see backfill_raised_dates_async). raised_date_checked
+        # tracks whether we've already attempted this job, so a job with
+        # genuinely no releasable date isn't retried forever on every sync.
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS raised_date DATE",
+        "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS raised_date_checked BOOLEAN DEFAULT FALSE",
         """CREATE TABLE IF NOT EXISTS job_status_history (
             id SERIAL PRIMARY KEY,
             job_id TEXT NOT NULL,
@@ -1039,13 +1047,23 @@ def _upsert_pipeline_row(dict_cur, conn, known_statuses, tab, item, r, default_s
                 status_text = (r.get("StatusText") or "").strip().lower()
                 status = "approved_to_invoice" if "approved" in status_text else "ready_for_payment"
 
-            job_type_text = (r.get("JobTypeText") or "").lower()
-            if "ppm" in job_type_text:
+            # Job category comes from the job number prefix, not Wisdom's
+            # JobTypeText — this matches Redstone's actual business rules
+            # (1000/3000 = reactive hourly, 2000 = PPM day rate, 5000/8000 =
+            # quoted) rather than relying on Wisdom's own text labelling,
+            # which doesn't reliably distinguish MIV from ordinary reactive
+            # work. Quoted jobs can show up as either a 5xxx DisplayId or an
+            # 8xxx WISDOMId for the same job — job_id above already prefers
+            # DisplayId, so checking display_id here is the safe one.
+            id_prefix = display_id[:1] if display_id else ""
+            if id_prefix == "2":
                 job_type = "ppm"
-            elif "quote" in job_type_text:
+            elif id_prefix in ("5", "8"):
                 job_type = "quoted"
+            elif id_prefix == "3":
+                job_type = "miv"
             else:
-                job_type = "reactive"
+                job_type = "reactive"  # 1000-series, and anything unrecognised
 
             try:
                 total_cost = float(r.get("TotalCost") or 0)
@@ -1099,7 +1117,83 @@ def _upsert_pipeline_row(dict_cur, conn, known_statuses, tab, item, r, default_s
         conn.rollback()
 
 
-async def scrape_all_pipeline_stages_async(client, conn, cur):
+async def backfill_raised_dates_async(client, conn, cur, limit=None):
+    """Backfill 'Date Released' (the true job-raised date) for jobs in the
+    permanent job_wetherspoons_costs table, via Wisdom's job detail lookup
+    (JobSet) — the billing feed itself doesn't carry this field at all.
+
+    PPM (2000-series) is deliberately excluded — Dave confirmed this
+    tracking is only wanted for reactive/MIV/quoted work.
+
+    `limit`: caps how many jobs to attempt this call, for safe small-batch
+    testing before committing to the full historic backlog (~3550 jobs).
+    Pass limit=None (default) for a full, unlimited run.
+
+    Uses the WISDOMId stored in each row's raw_totals_json as the lookup
+    ID — this is what Wisdom's own internal system uses to key a job
+    detail record, distinct from the customer-facing DisplayId."""
+    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    query = """
+        SELECT job_id, raw_totals_json->>'WISDOMId' as wisdom_id
+        FROM job_wetherspoons_costs
+        WHERE raised_date_checked = FALSE
+          AND job_type IN ('reactive', 'miv', 'quoted')
+          AND raw_totals_json->>'WISDOMId' IS NOT NULL
+        ORDER BY payment_date DESC NULLS LAST
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    dict_cur.execute(query)
+    to_fetch = dict_cur.fetchall()
+    dict_cur.close()
+
+    if not to_fetch:
+        log.info("Raised-date backfill: nothing left to check.")
+        return
+
+    log.info(f"Raised-date backfill: attempting {len(to_fetch)} job(s)...")
+
+    found = 0
+    blank = 0
+    errored = 0
+    for i, row in enumerate(to_fetch, 1):
+        job_id = row["job_id"]
+        wisdom_id = row["wisdom_id"]
+        try:
+            detail = await client.get_job_detail(wisdom_id)
+            await asyncio.sleep(0.2)
+            raised = _parse_wisdom_date(detail.get("DateReleased"))
+            if raised:
+                cur.execute("""
+                    UPDATE job_wetherspoons_costs
+                    SET raised_date = %s, raised_date_checked = TRUE
+                    WHERE job_id = %s
+                """, (raised, job_id))
+                found += 1
+            else:
+                cur.execute("""
+                    UPDATE job_wetherspoons_costs SET raised_date_checked = TRUE
+                    WHERE job_id = %s
+                """, (job_id,))
+                blank += 1
+        except Exception as e:
+            log.warning(f"Raised-date lookup failed for job {job_id} (WISDOMId {wisdom_id}): {e}")
+            errored += 1
+            continue
+
+        if i % 50 == 0:
+            conn.commit()
+            log.info(f"  Raised-date backfill: {i} of {len(to_fetch)} checked so far...")
+
+    conn.commit()
+    log.info(
+        f"Raised-date backfill complete: {found} found, {blank} blank "
+        f"(genuinely no DateReleased on Wisdom's side), {errored} errored."
+    )
+
+
+
     """Run the pipeline scrape across all four Wisdom billing stages."""
     log.info("Scraping Wisdom billing pipeline (Awaiting Costs / Ready for Payment / Invoiced / Paid)")
     for tab, item, default_status in PIPELINE_TARGETS:
