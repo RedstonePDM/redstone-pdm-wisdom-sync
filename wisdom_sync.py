@@ -774,8 +774,15 @@ async def scrape_outcome_reason(client, job_id, display_id):
 # Each entry: (Tab, Item, default status if a row's own StatusText doesn't
 # tell us otherwise). Ready For Payment blends two real statuses in one feed
 # (Wisdom's own StatusText distinguishes them), everything else is one status.
+#
+# NOTE: HOVQUERY's Item value is a guess, following the same naming pattern
+# as the other three confirmed URLs (tab name + sub-tab name, no spaces, all
+# caps). This has NOT been verified against Wisdom yet — same situation as
+# the INVOICED tab was originally. If the "HOV Query" count on the Reports &
+# Margin page stays stuck at 0 after a sync, this is the first thing to check.
 PIPELINE_TARGETS = [
     ("ADMIN",   "AWAITINGCOSTS",   "awaiting_costs"),
+    ("ADMIN",   "HOVQUERY",        "hov_query"),      # unverified guess — see note above
     ("ADMIN",   "READYFORPAYMENT", None),  # status read per-row from StatusText
     ("PAYMENT", "INVOICED",        "invoiced"),
     ("PAYMENT", "PAID",            "paid"),
