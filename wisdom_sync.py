@@ -1224,18 +1224,33 @@ async def scrape_outcomes_async(client, conn, cur):
                 if not job_id:
                     continue
 
-                # Skip if already recorded
+                # Skip only if we've already recorded a TERMINAL outcome for
+                # this job — lost/cancelled/won-then-cancelled don't change
+                # after the fact, so there's nothing new to check. A 'won'
+                # outcome is deliberately NOT treated as terminal here: a
+                # won job can still be cancelled afterwards (Dave's real
+                # £50k+ example), and the old version of this code silently
+                # stopped watching a job the moment it was first marked
+                # won — meaning post-win cancellations were never detected
+                # at all, not even once.
                 cur.execute(
-                    "SELECT id FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
+                    "SELECT id, outcome FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
                     (job_id, display_id)
                 )
-                if cur.fetchone():
+                existing = cur.fetchone()
+                existing_outcome = existing["outcome"] if existing else None
+                if existing_outcome and existing_outcome != "won":
                     continue
 
                 await asyncio.sleep(0.8)
                 outcome_data = await scrape_outcome_reason(client, job_id, display_id)
 
-                outcome_type = "cancelled" if item == "CANCELLATIONS" else "lost"
+                base_outcome = "cancelled" if item == "CANCELLATIONS" else "lost"
+                # If this job was previously won and is ONLY NOW showing up
+                # as cancelled/rejected, that's a post-win cancellation —
+                # tracked as its own distinct outcome so it's never silently
+                # merged into ordinary pre-decision losses.
+                outcome_type = "won_then_cancelled" if existing_outcome == "won" else base_outcome
 
                 # Match to survey_form
                 cur.execute(
@@ -1253,6 +1268,7 @@ async def scrape_outcomes_async(client, conn, cur):
                         pub_name, trade_type, t3_decision, detected_at)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
                        ON CONFLICT (display_id) DO UPDATE SET
+                           outcome=EXCLUDED.outcome,
                            wisdom_status=EXCLUDED.wisdom_status,
                            wisdom_reason=EXCLUDED.wisdom_reason,
                            reason_heading=EXCLUDED.reason_heading,
