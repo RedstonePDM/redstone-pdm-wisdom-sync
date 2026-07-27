@@ -1218,7 +1218,17 @@ async def scrape_outcomes_async(client, conn, cur):
                 # empty — which is almost certainly why quote_outcomes had
                 # zero rows despite Wisdom clearly having data to find.
                 try:
-                    job_id     = job_summary.get("JobId", "")
+                    # JobId alone isn't reliable across every Wisdom feed —
+                    # PAYMENT/PAID, for instance, only returns WISDOMId, not
+                    # JobId at all. Every OTHER working part of this file
+                    # falls back through JobId → WISDOMId → DisplayId; this
+                    # function was the one place that didn't, meaning
+                    # job_id came back empty for every job on feeds that
+                    # don't use JobId — silently skipping every single one
+                    # before any logging even ran. That's the real reason
+                    # this table has been empty the whole project.
+                    job_id     = (job_summary.get("JobId") or job_summary.get("WISDOMId")
+                                  or job_summary.get("DisplayId") or "")
                     display_id = job_summary.get("DisplayId", "") or job_id
                     wisdom_status = job_summary.get("StatusText", item)
                     pub_name   = (job_summary.get("PubName") or
@@ -1226,6 +1236,7 @@ async def scrape_outcomes_async(client, conn, cur):
                     trade_type = job_summary.get("TradetypeText", "")
 
                     if not job_id:
+                        log.warning(f"Skipping a {label} job with no usable ID at all — raw fields: {list(job_summary.keys())}")
                         continue
 
                     # Skip only if we've already recorded a TERMINAL outcome
