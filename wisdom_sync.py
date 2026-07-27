@@ -862,24 +862,34 @@ if __name__ == "__main__":
 
 # ── Outcome Scraping Functions ────────────────────────────────────────────────
 
-async def scrape_outcome_reason(client, job_id, display_id):
+async def scrape_outcome_reason(page, job_id, display_id):
     """Navigate into a rejected/cancelled Wisdom job, click the Quote tab,
-    and extract the outcome reason, heading, and date."""
+    and extract the outcome reason, heading, and date.
+
+    Takes an explicit `page` rather than reaching into a shared client
+    object. This matters: this function does a full page navigation
+    (page.goto), and the rest of the sync makes its API calls via
+    page.evaluate() against Wisdom's own SPA page. Navigating a page that
+    something else is mid-evaluate() on throws 'Execution context was
+    destroyed' — exactly the random crash seen a few times during this
+    project. Running this on its own dedicated, isolated page (opened and
+    closed by the caller) means it can never interfere with anything else
+    the sync is doing, however it fails."""
     try:
         job_url = (
             f"{WISDOM_BASE}/wisdom(bD1lbiZjPTEwMA==)/ContractorPortal#/jobDetail/{job_id}"
         )
         log.info(f"Scraping outcome for {display_id or job_id}")
-        await client._page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
-        await client._page.wait_for_timeout(2500)
+        await page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(2500)
 
         # Click the Quote tab — try multiple selectors
         clicked = False
         for selector in ["text=Quote", "a:has-text('Quote')", "[ng-click*='quote']"]:
             try:
-                el = await client._page.wait_for_selector(selector, timeout=5000)
+                el = await page.wait_for_selector(selector, timeout=5000)
                 await el.click()
-                await client._page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1500)
                 clicked = True
                 break
             except Exception:
@@ -890,7 +900,7 @@ async def scrape_outcome_reason(client, job_id, display_id):
             return {}
 
         # Extract all visible text and parse heading + reason
-        page_text = await client._page.inner_text("body")
+        page_text = await page.inner_text("body")
         lines = [l.strip() for l in page_text.split("\n") if l.strip()]
 
         heading = ""
@@ -1206,97 +1216,122 @@ async def backfill_raised_dates_async(client, conn, cur, limit=None):
 
 
 async def scrape_outcomes_async(client, conn, cur):
-    """Scrape rejected and cancelled jobs for outcome reasons, then record them."""
-    for tab, item, label in OUTCOME_TARGETS:
-        log.info(f"Scraping outcomes: {label}")
-        try:
-            results, total = await client.get_job_list(tab, item, skip=0, top=100)
-            log.info(f"  {total} jobs found in {label}")
+    """Scrape rejected and cancelled jobs for outcome reasons, then record
+    them. Opens ONE isolated page (separate from client._page) for the
+    per-job detail lookups, used for every job in this run, closed at the
+    end — never touching the page the rest of the sync depends on."""
+    detail_page = await client._context.new_page()
+    try:
+        for tab, item, label in OUTCOME_TARGETS:
+            log.info(f"Scraping outcomes: {label}")
+            try:
+                results, total = await client.get_job_list(tab, item, skip=0, top=100)
+                log.info(f"  {total} jobs found in {label}")
+            except Exception as e:
+                log.error(f"Failed to fetch outcome list for {label}: {e}", exc_info=True)
+                continue
 
             for job_summary in results:
-                job_id     = job_summary.get("JobId", "")
-                display_id = job_summary.get("DisplayId", "") or job_id
-                wisdom_status = job_summary.get("StatusText", item)
-                pub_name   = (job_summary.get("PubName") or
-                              job_summary.get("LocationText", ""))
-                trade_type = job_summary.get("TradetypeText", "")
+                # Each job fully isolated — one job's failure (network
+                # blip, unexpected page layout, whatever) must never wipe
+                # out outcomes already successfully recorded for others in
+                # this same batch. The old version of this code wrapped
+                # the ENTIRE loop in one try/except, so a single bad job
+                # rolled back everything and silently left the table
+                # empty — which is almost certainly why quote_outcomes had
+                # zero rows despite Wisdom clearly having data to find.
+                try:
+                    job_id     = job_summary.get("JobId", "")
+                    display_id = job_summary.get("DisplayId", "") or job_id
+                    wisdom_status = job_summary.get("StatusText", item)
+                    pub_name   = (job_summary.get("PubName") or
+                                  job_summary.get("LocationText", ""))
+                    trade_type = job_summary.get("TradetypeText", "")
 
-                if not job_id:
-                    continue
+                    if not job_id:
+                        continue
 
-                # Skip only if we've already recorded a TERMINAL outcome for
-                # this job — lost/cancelled/won-then-cancelled don't change
-                # after the fact, so there's nothing new to check. A 'won'
-                # outcome is deliberately NOT treated as terminal here: a
-                # won job can still be cancelled afterwards (Dave's real
-                # £50k+ example), and the old version of this code silently
-                # stopped watching a job the moment it was first marked
-                # won — meaning post-win cancellations were never detected
-                # at all, not even once.
-                cur.execute(
-                    "SELECT id, outcome FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
-                    (job_id, display_id)
-                )
-                existing = cur.fetchone()
-                existing_outcome = existing["outcome"] if existing else None
-                if existing_outcome and existing_outcome != "won":
-                    continue
-
-                await asyncio.sleep(0.8)
-                outcome_data = await scrape_outcome_reason(client, job_id, display_id)
-
-                base_outcome = "cancelled" if item == "CANCELLATIONS" else "lost"
-                # If this job was previously won and is ONLY NOW showing up
-                # as cancelled/rejected, that's a post-win cancellation —
-                # tracked as its own distinct outcome so it's never silently
-                # merged into ordinary pre-decision losses.
-                outcome_type = "won_then_cancelled" if existing_outcome == "won" else base_outcome
-
-                # Match to survey_form
-                cur.execute(
-                    """SELECT id, submitted_at FROM survey_forms
-                       WHERE job_id=%s OR job_id=%s
-                       ORDER BY submitted_at DESC LIMIT 1""",
-                    (job_id, display_id)
-                )
-                sf = cur.fetchone()
-
-                cur.execute(
-                    """INSERT INTO quote_outcomes
-                       (job_id, display_id, survey_form_id, outcome, wisdom_status,
-                        wisdom_reason, reason_heading, reason_date,
-                        pub_name, trade_type, t3_decision, detected_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
-                       ON CONFLICT (display_id) DO UPDATE SET
-                           outcome=EXCLUDED.outcome,
-                           wisdom_status=EXCLUDED.wisdom_status,
-                           wisdom_reason=EXCLUDED.wisdom_reason,
-                           reason_heading=EXCLUDED.reason_heading,
-                           reason_date=EXCLUDED.reason_date,
-                           detected_at=NOW()""",
-                    (job_id, display_id, sf["id"] if sf else None,
-                     outcome_type, wisdom_status,
-                     outcome_data.get("reason", ""),
-                     outcome_data.get("heading", ""),
-                     outcome_data.get("date", ""),
-                     pub_name, trade_type)
-                )
-
-                if sf:
+                    # Skip only if we've already recorded a TERMINAL outcome
+                    # for this job — a 'won' outcome is deliberately NOT
+                    # terminal, since a won job can still be cancelled
+                    # afterwards (Dave's real £50k+ example).
                     cur.execute(
-                        """UPDATE survey_forms SET status=%s, outcome=%s,
-                           outcome_reason=%s, updated_at=NOW() WHERE id=%s""",
-                        (outcome_type, outcome_type,
-                         outcome_data.get("reason", ""), sf["id"])
+                        "SELECT id, outcome FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
+                        (job_id, display_id)
+                    )
+                    existing = cur.fetchone()
+                    existing_outcome = existing["outcome"] if existing else None
+                    if existing_outcome and existing_outcome != "won":
+                        continue
+
+                    # Categorise straight from the list feed's own status
+                    # text — Wisdom already tells us 'RFQ Withdrawn' (JDW
+                    # declined us) vs 'Declined To Quote' (WE chose not to
+                    # quote) right there in the list, no per-job page visit
+                    # needed for this distinction. Only the deeper 'why'
+                    # reason (e.g. 'Different Contractor Required') needs
+                    # the fragile per-job lookup below.
+                    status_lower = (wisdom_status or "").lower()
+                    if existing_outcome == "won":
+                        outcome_type = "won_then_cancelled"
+                    elif item == "CANCELLATIONS":
+                        outcome_type = "cancelled"
+                    elif "declined to quote" in status_lower:
+                        outcome_type = "declined_to_quote"
+                    else:
+                        outcome_type = "lost"  # RFQ Withdrawn — JDW went elsewhere
+
+                    await asyncio.sleep(0.8)
+                    outcome_data = await scrape_outcome_reason(detail_page, job_id, display_id)
+
+                    # Match to survey_form
+                    cur.execute(
+                        """SELECT id, submitted_at FROM survey_forms
+                           WHERE job_id=%s OR job_id=%s
+                           ORDER BY submitted_at DESC LIMIT 1""",
+                        (job_id, display_id)
+                    )
+                    sf = cur.fetchone()
+
+                    cur.execute(
+                        """INSERT INTO quote_outcomes
+                           (job_id, display_id, survey_form_id, outcome, wisdom_status,
+                            wisdom_reason, reason_heading, reason_date,
+                            pub_name, trade_type, t3_decision, detected_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+                           ON CONFLICT (display_id) DO UPDATE SET
+                               outcome=EXCLUDED.outcome,
+                               wisdom_status=EXCLUDED.wisdom_status,
+                               wisdom_reason=EXCLUDED.wisdom_reason,
+                               reason_heading=EXCLUDED.reason_heading,
+                               reason_date=EXCLUDED.reason_date,
+                               detected_at=NOW()""",
+                        (job_id, display_id, sf["id"] if sf else None,
+                         outcome_type, wisdom_status,
+                         outcome_data.get("reason", ""),
+                         outcome_data.get("heading", ""),
+                         outcome_data.get("date", ""),
+                         pub_name, trade_type)
                     )
 
-                conn.commit()
-                log.info(f"  Recorded {outcome_type}: {display_id} — "
-                         f"{outcome_data.get('reason','(no reason)')}")
+                    if sf:
+                        cur.execute(
+                            """UPDATE survey_forms SET status=%s, outcome=%s,
+                               outcome_reason=%s, updated_at=NOW() WHERE id=%s""",
+                            (outcome_type, outcome_type,
+                             outcome_data.get("reason", ""), sf["id"])
+                        )
 
-        except Exception as e:
-            conn.rollback()
-            log.error(f"scrape_outcomes_async failed for {label}: {e}", exc_info=True)
+                    conn.commit()
+                    log.info(f"  Recorded {outcome_type}: {display_id} — "
+                             f"{outcome_data.get('reason','(no reason)')}")
+
+                except Exception as job_err:
+                    conn.rollback()
+                    log.error(f"Failed to record outcome for job {job_summary.get('DisplayId') or job_summary.get('JobId')}: {job_err}", exc_info=True)
+                    continue
+    finally:
+        await detail_page.close()
 
 
 async def detect_wins_async(conn, cur):
