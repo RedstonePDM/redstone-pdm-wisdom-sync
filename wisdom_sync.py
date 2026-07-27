@@ -837,29 +837,6 @@ def run_sync():
     asyncio.run(run_sync_async())
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    init_db()
-
-    run_once = os.environ.get("RUN_ONCE", "false").lower() == "true"
-
-    if run_once:
-        run_sync()
-    else:
-        sync_interval = int(os.environ.get("SYNC_INTERVAL_MINUTES", "120"))
-        log.info(f"Running in scheduled mode. Sync every {sync_interval} minutes.")
-
-        while True:
-            try:
-                run_sync()
-            except Exception as e:
-                log.error(f"Sync cycle failed: {e}", exc_info=True)
-
-            log.info(f"Next sync in {sync_interval} minutes.")
-            time.sleep(sync_interval * 60)
-
-
 # ── Outcome Scraping Functions ────────────────────────────────────────────────
 
 async def scrape_outcome_reason(page, job_id, display_id):
@@ -1203,7 +1180,7 @@ async def backfill_raised_dates_async(client, conn, cur, limit=None):
     )
 
 
-
+async def scrape_all_pipeline_stages_async(client, conn, cur):
     """Run the pipeline scrape across all four Wisdom billing stages."""
     log.info("Scraping Wisdom billing pipeline (Awaiting Costs / Ready for Payment / Invoiced / Paid)")
     for tab, item, default_status in PIPELINE_TARGETS:
@@ -1370,3 +1347,39 @@ async def detect_wins_async(conn, cur):
     except Exception as e:
         conn.rollback()
         log.error(f"detect_wins_async failed: {e}", exc_info=True)
+
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+# Placed at the very end of the file, AFTER every function definition —
+# deliberately. If this sits anywhere in the middle of the file (as it did
+# before), running this script directly (python3 wisdom_sync.py — which is
+# exactly how Railway starts the container as its main, permanent process)
+# executes this block the moment Python reaches it, calling run_sync()
+# immediately. Any function defined LATER in the file than this point
+# would not exist yet at that moment, causing NameError — which is exactly
+# what silently broke the automatic 2-hourly sync's billing pipeline,
+# outcome tracking, and win detection for the whole project. Manual runs
+# via `from wisdom_sync import run_sync; run_sync()` never hit this,
+# because importing a module runs the ENTIRE file top-to-bottom first
+# (skipping this block, since __name__ != '__main__' on import) before
+# anything gets called externally — which is why those always worked fine.
+
+if __name__ == "__main__":
+    init_db()
+
+    run_once = os.environ.get("RUN_ONCE", "false").lower() == "true"
+
+    if run_once:
+        run_sync()
+    else:
+        sync_interval = int(os.environ.get("SYNC_INTERVAL_MINUTES", "120"))
+        log.info(f"Running in scheduled mode. Sync every {sync_interval} minutes.")
+
+        while True:
+            try:
+                run_sync()
+            except Exception as e:
+                log.error(f"Sync cycle failed: {e}", exc_info=True)
+
+            log.info(f"Next sync in {sync_interval} minutes.")
+            time.sleep(sync_interval * 60)
