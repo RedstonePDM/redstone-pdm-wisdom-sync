@@ -153,6 +153,16 @@ def init_db():
         # genuinely no releasable date isn't retried forever on every sync.
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS raised_date DATE",
         "ALTER TABLE job_wetherspoons_costs ADD COLUMN IF NOT EXISTS raised_date_checked BOOLEAN DEFAULT FALSE",
+        # Historic quote-outcome backfill, sourced from Dave's own JDW
+        # notification emails (Quote Approved / Quote Cancelled labels) —
+        # since Wisdom's live Rejected/Cancellations feeds only show
+        # recent items, this is the only way to recover older history.
+        # 'source' distinguishes these from records the regular 2-hourly
+        # sync detects live, so the two are never confused with each other.
+        "ALTER TABLE quote_outcomes ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'live_sync'",
+        "ALTER TABLE quote_outcomes ADD COLUMN IF NOT EXISTS email_approved_value NUMERIC(10,2)",
+        "ALTER TABLE quote_outcomes ADD COLUMN IF NOT EXISTS email_approved_date DATE",
+        "ALTER TABLE quote_outcomes ADD COLUMN IF NOT EXISTS email_cancelled_date DATE",
         """CREATE TABLE IF NOT EXISTS job_status_history (
             id SERIAL PRIMARY KEY,
             job_id TEXT NOT NULL,
@@ -1192,7 +1202,178 @@ async def scrape_all_pipeline_stages_async(client, conn, cur):
     log.info("Pipeline scrape complete")
 
 
-async def scrape_outcomes_async(client, conn, cur):
+async def backfill_email_derived_outcomes(client, conn, cur):
+    """One-off historic backfill for won-then-cancelled quotes, sourced from
+    Dave's own JDW notification emails rather than Wisdom's live feeds.
+
+    Why this exists: Wisdom's own Rejected/Cancellations tabs only show
+    recent items — once a job drops off, there's no 'history' view to
+    recover it from inside Wisdom itself. But Dave has Gmail labels for
+    every 'Quote Approved' and 'Quote Cancelled' notification going back
+    years, and cross-referencing the two confirmed EVERY job in his
+    'Quote Cancelled' folder was previously approved — a clean, complete,
+    100%-confirmed list of won-then-cancelled quotes with known £ values,
+    with only the WHY (Wisdom's own cancellation reason) still missing.
+
+    This looks each one up on Wisdom directly by job code — the same way
+    Dave proved works by typing an old job number straight into Wisdom's
+    own search bar — to pull the real reason, on the same isolated page
+    used by the live outcome scraper so it can't interfere with anything
+    else the sync is doing."""
+
+    # (job_code, cancelled_date, approved_value, approved_date) — pulled
+    # directly from JDW's own emails, cross-referenced and confirmed.
+    EMAIL_BACKFILL_JOBS = [
+        ("50000442735", "2026-07-24", 466.50, "2026-05-19"),
+        ("50000442704", "2026-07-13", 653.45, "2026-04-28"),
+        ("50000448405", "2026-06-17", 1740.00, "2026-06-07"),
+        ("50000399165", "2026-06-09", 7179.50, "2025-06-24"),
+        ("50000427541", "2026-05-22", 3094.80, "2026-04-30"),
+        ("50000439338", "2026-05-21", 1503.00, "2026-04-28"),
+        ("50000437626", "2026-05-19", 2345.80, "2026-04-28"),
+        ("50000433786", "2026-05-19", 3271.00, "2026-03-18"),
+        ("50000414419", "2026-05-18", 3495.00, "2026-03-26"),
+        ("50000438256", "2026-04-06", 896.40, "2026-03-11"),
+        ("50000403686", "2026-03-27", 729.00, "2025-09-22"),
+        ("50000435558", "2026-03-23", 1072.00, "2026-02-09"),
+        ("50000435220", "2026-03-17", 475.00, "2026-02-09"),
+        ("50000436430", "2026-03-11", 480.00, "2026-02-16"),
+        ("50000434039", "2026-03-02", 485.00, "2026-01-23"),
+        ("50000403805", "2026-02-25", 8995.00, "2025-07-18"),
+        ("50000392885", "2026-02-10", 13166.80, "2025-12-23"),
+        ("50000424630", "2026-01-08", 9719.80, "2025-12-31"),
+        ("50000392971", "2026-01-08", 5613.78, "2025-12-23"),
+        ("50000423296", "2025-12-01", 450.00, "2025-10-13"),
+        ("50000423293", "2025-12-01", 450.00, "2025-10-13"),
+        ("50000419278", "2025-12-01", 475.00, "2025-09-16"),
+        ("50000419248", "2025-12-01", 485.00, "2025-09-16"),
+        ("50000419197", "2025-12-01", 475.00, "2025-09-16"),
+        ("50000423311", "2025-12-01", 450.00, "2025-10-13"),
+        ("50000423310", "2025-12-01", 450.00, "2025-10-13"),
+        ("50000423304", "2025-12-01", 475.00, "2025-10-13"),
+        ("50000423302", "2025-12-01", 450.00, "2025-10-13"),
+        ("50000411260", "2025-12-01", 250.00, "2025-07-28"),
+        ("50000423301", "2025-12-01", 450.00, "2025-10-13"),
+        ("50000423308", "2025-11-14", 475.00, "2025-10-13"),
+        ("50000423294", "2025-11-14", 450.00, "2025-10-13"),
+        ("50000423292", "2025-11-14", 475.00, "2025-10-13"),
+        ("50000423273", "2025-11-14", 475.00, "2025-10-13"),
+        ("50000419287", "2025-10-24", 475.00, "2025-09-16"),
+        ("50000415989", "2025-10-09", 219.00, "2025-08-14"),
+        ("50000420241", "2025-10-08", 4566.00, "2025-10-08"),
+        ("50000413650", "2025-09-25", 6218.00, "2025-09-01"),
+        ("50000419192", "2025-09-17", 450.00, "2025-09-16"),
+        ("50000411270", "2025-09-12", 520.00, "2025-07-31"),
+        ("50000404071", "2025-07-30", 3555.00, "2025-07-07"),
+        ("50000401637", "2025-07-07", 790.00, "2025-06-18"),
+        ("50000408897", "2025-07-03", 475.00, "2025-06-23"),
+        ("50000402695", "2025-06-30", 465.00, "2025-05-02"),
+        ("50000404002", "2025-05-14", 475.00, "2025-05-11"),
+        ("50000403097", "2025-05-11", 465.00, "2025-05-02"),
+        ("50000396659", "2025-05-05", 22116.40, "2025-03-03"),
+        ("50000397309", "2025-04-22", 495.00, "2025-03-09"),
+        ("50000398989", "2025-04-17", 1340.00, "2025-03-24"),
+        ("50000390506", "2025-01-26", 495.00, "2025-01-21"),
+        ("50000368297", "2024-11-18", 475.00, "2024-07-05"),
+        ("50000381348", "2024-11-18", 450.00, "2024-10-13"),
+        ("50000372657", "2024-10-11", 375.00, "2024-08-28"),
+        ("50000372196", "2024-08-13", 495.00, "2024-08-01"),
+        ("50000340501", "2024-04-19", 2650.00, "2024-02-26"),
+        ("50000349429", "2024-03-20", 495.00, "2024-02-21"),
+        ("50000341350", "2024-02-09", 1640.00, "2024-02-07"),
+        ("50000339641", "2024-01-12", 2075.00, "2023-12-20"),
+        ("50000307614", "2023-11-17", 495.00, "2023-06-18"),
+        ("50000329569", "2023-11-06", 450.00, "2023-09-09"),
+        ("50000324175", "2023-11-05", 1615.00, "2023-10-11"),
+        ("50000334524", "2023-10-22", 495.00, "2023-10-12"),
+        ("50000329571", "2023-10-19", 450.00, "2023-09-09"),
+        ("50000330850", "2023-10-11", 450.00, "2023-09-13"),
+        ("50000325428", "2023-10-11", 450.00, "2023-07-30"),
+        ("50000323487", "2023-09-19", 495.00, "2023-07-30"),
+        ("50000318132", "2023-09-13", 450.00, "2023-06-16"),
+        ("50000323480", "2023-09-13", 450.00, "2023-07-30"),
+        ("50000318117", "2023-07-27", 495.00, "2023-06-16"),
+        ("50000313895", "2023-07-11", 450.00, "2023-05-15"),
+        ("50000318137", "2023-07-11", 450.00, "2023-06-16"),
+        ("50000313894", "2023-07-11", 450.00, "2023-05-15"),
+        ("50000308648", "2023-07-11", 450.00, "2023-04-05"),
+        ("50000317377", "2023-06-20", 495.00, "2023-06-16"),
+        ("50000313892", "2023-06-20", 450.00, "2023-05-15"),
+        ("50000300367", "2023-03-13", 350.00, "2023-01-10"),
+        ("50000297942", "2023-02-06", 295.00, "2022-12-06"),
+        ("50000294083", "2023-02-06", 350.00, "2022-10-08"),
+        ("50000293719", "2022-12-05", 1365.85, "2022-10-11"),
+        ("50000294084", "2022-11-02", 350.00, "2022-10-08"),
+        ("50000292660", "2022-10-11", 350.00, "2022-09-30"),
+    ]
+
+    detail_page = await client._context.new_page()
+    found = 0
+    blank = 0
+    errored = 0
+    skipped = 0
+
+    try:
+        for i, (job_code, cancelled_date, approved_value, approved_date) in enumerate(EMAIL_BACKFILL_JOBS, 1):
+            try:
+                # Don't overwrite a record the live sync has already
+                # properly detected and populated — this backfill is only
+                # meant to fill genuine gaps.
+                cur.execute("SELECT id, outcome FROM quote_outcomes WHERE display_id = %s", (job_code,))
+                existing = cur.fetchone()
+                if existing and existing["outcome"] == "won_then_cancelled":
+                    skipped += 1
+                    continue
+
+                await asyncio.sleep(0.8)
+                outcome_data = await scrape_outcome_reason(detail_page, job_code, job_code)
+                reason = outcome_data.get("reason", "")
+                if reason:
+                    found += 1
+                else:
+                    blank += 1
+
+                cur.execute("""
+                    INSERT INTO quote_outcomes
+                        (job_id, display_id, outcome, wisdom_status, wisdom_reason,
+                         reason_heading, reason_date, t3_decision, detected_at,
+                         source, email_approved_value, email_approved_date, email_cancelled_date)
+                    VALUES (%s,%s,'won_then_cancelled','Job Cancelled',%s,%s,%s,%s,NOW(),
+                            'email_backfill',%s,%s,%s)
+                    ON CONFLICT (display_id) DO UPDATE SET
+                        outcome='won_then_cancelled',
+                        wisdom_reason=EXCLUDED.wisdom_reason,
+                        reason_heading=EXCLUDED.reason_heading,
+                        reason_date=EXCLUDED.reason_date,
+                        source='email_backfill',
+                        email_approved_value=EXCLUDED.email_approved_value,
+                        email_approved_date=EXCLUDED.email_approved_date,
+                        email_cancelled_date=EXCLUDED.email_cancelled_date,
+                        detected_at=NOW()
+                """, (job_code, job_code, reason, outcome_data.get("heading", ""),
+                      outcome_data.get("date", ""), approved_date,
+                      approved_value, approved_date, cancelled_date))
+                conn.commit()
+                log.info(f"  Email backfill {i}/{len(EMAIL_BACKFILL_JOBS)}: {job_code} — reason: {reason or '(blank)'}")
+
+            except Exception as job_err:
+                conn.rollback()
+                errored += 1
+                log.error(f"Email backfill failed for job {job_code}: {job_err}", exc_info=True)
+                continue
+
+            if i % 20 == 0:
+                log.info(f"  Email backfill progress: {i} of {len(EMAIL_BACKFILL_JOBS)} processed...")
+    finally:
+        await detail_page.close()
+
+    log.info(
+        f"Email-derived outcome backfill complete: {found} reasons found, "
+        f"{blank} blank (Wisdom had no reason text), {skipped} already recorded, {errored} errored."
+    )
+
+
+
     """Scrape rejected and cancelled jobs for outcome reasons, then record
     them. Opens ONE isolated page (separate from client._page) for the
     per-job detail lookups, used for every job in this run, closed at the
