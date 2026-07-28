@@ -1318,9 +1318,12 @@ async def backfill_email_derived_outcomes(client, conn, cur):
             try:
                 # Don't overwrite a record the live sync has already
                 # properly detected and populated — this backfill is only
-                # meant to fill genuine gaps.
-                cur.execute("SELECT id, outcome FROM quote_outcomes WHERE display_id = %s", (job_code,))
-                existing = cur.fetchone()
+                # meant to fill genuine gaps. Local dict-cursor here since
+                # the passed-in `cur` is a plain tuple cursor.
+                dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                dict_cur.execute("SELECT id, outcome FROM quote_outcomes WHERE display_id = %s", (job_code,))
+                existing = dict_cur.fetchone()
+                dict_cur.close()
                 if existing and existing["outcome"] == "won_then_cancelled":
                     skipped += 1
                     continue
@@ -1373,7 +1376,7 @@ async def backfill_email_derived_outcomes(client, conn, cur):
     )
 
 
-
+async def scrape_outcomes_async(client, conn, cur):
     """Scrape rejected and cancelled jobs for outcome reasons, then record
     them. Opens ONE isolated page (separate from client._page) for the
     per-job detail lookups, used for every job in this run, closed at the
@@ -1424,11 +1427,19 @@ async def backfill_email_derived_outcomes(client, conn, cur):
                     # for this job — a 'won' outcome is deliberately NOT
                     # terminal, since a won job can still be cancelled
                     # afterwards (Dave's real £50k+ example).
-                    cur.execute(
+                    #
+                    # A local RealDictCursor here specifically — the `cur`
+                    # this function is called with is a plain tuple cursor
+                    # (get_db()'s docstring claims otherwise, but doesn't
+                    # actually set that), so existing["outcome"] would
+                    # throw TypeError on a plain cursor. This bit it twice.
+                    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    dict_cur.execute(
                         "SELECT id, outcome FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
                         (job_id, display_id)
                     )
-                    existing = cur.fetchone()
+                    existing = dict_cur.fetchone()
+                    dict_cur.close()
                     existing_outcome = existing["outcome"] if existing else None
                     if existing_outcome and existing_outcome != "won":
                         continue
