@@ -171,6 +171,21 @@ def init_db():
             detected_at TIMESTAMPTZ DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS idx_job_status_history_job_id ON job_status_history(job_id)",
+        # QUOTEREQUEST-tab status history — job_status_history above only
+        # tracks the billing pipeline (ADMIN/PAYMENT), never QUOTEREQUEST,
+        # so there has been no record of when a job moves from Awaiting
+        # Submission to Awaiting Approval (i.e. when we actually submitted
+        # our quote). One row per genuine sub_tab change, written from
+        # upsert_job below — this is what the Quote Analytics 'Released ->
+        # Quote Submitted' timing tile reads.
+        """CREATE TABLE IF NOT EXISTS quoterequest_status_history (
+            id SERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            display_id TEXT,
+            sub_tab TEXT NOT NULL,
+            detected_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_qr_status_history_job_id ON quoterequest_status_history(job_id)",
         # Geocoded pub locations — foundation for the recruitment coverage
         # map. Keyed by pub_name (matches how pubs are already grouped
         # everywhere else in the platform). One row per pub, refreshed only
@@ -382,6 +397,7 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
 
     cur.execute("SELECT job_id, status FROM jobs WHERE job_id = %s", (job_id,))
     existing = cur.fetchone()
+    previous_status = existing["status"] if existing else None
 
     row = {
         "job_id":           job_id,
@@ -409,6 +425,12 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
         "last_updated":     now,
         "raw_json":         psycopg2.extras.Json(job_data),
     }
+
+    if tab == "QUOTEREQUEST" and (not existing or previous_status != sub_tab):
+        cur.execute("""
+            INSERT INTO quoterequest_status_history (job_id, display_id, sub_tab)
+            VALUES (%(job_id)s, %(display_id)s, %(status)s)
+        """, row)
 
     if not existing:
         cur.execute("""
