@@ -883,7 +883,21 @@ async def scrape_outcome_reason(page, job_id, display_id):
                 continue
 
         if not clicked:
-            log.warning(f"Could not click Quote tab for {job_id}")
+            # Dump what actually loaded, so we can fix the real problem
+            # instead of guessing at selectors blind a second time.
+            try:
+                actual_url = page.url
+                actual_title = await page.title()
+                body_preview = (await page.inner_text("body"))[:500]
+            except Exception as diag_err:
+                actual_url = f"(couldn't read: {diag_err})"
+                actual_title = "(unknown)"
+                body_preview = "(unknown)"
+            log.warning(
+                f"Could not click Quote tab for {job_id}. "
+                f"Landed on URL: {actual_url} | Title: {actual_title} | "
+                f"Body preview: {body_preview!r}"
+            )
             return {}
 
         # Extract all visible text and parse heading + reason
@@ -1316,15 +1330,19 @@ async def backfill_email_derived_outcomes(client, conn, cur):
     try:
         for i, (job_code, cancelled_date, approved_value, approved_date) in enumerate(EMAIL_BACKFILL_JOBS, 1):
             try:
-                # Don't overwrite a record the live sync has already
-                # properly detected and populated — this backfill is only
-                # meant to fill genuine gaps. Local dict-cursor here since
-                # the passed-in `cur` is a plain tuple cursor.
+                # Only skip if this job already has a REAL reason recorded
+                # — not just because a row exists. Otherwise a re-run
+                # after fixing a scraping bug would skip every job again,
+                # including the ones that only got a blank reason last
+                # time through no fault of the classification itself.
                 dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-                dict_cur.execute("SELECT id, outcome FROM quote_outcomes WHERE display_id = %s", (job_code,))
+                dict_cur.execute(
+                    "SELECT id, outcome, wisdom_reason FROM quote_outcomes WHERE display_id = %s",
+                    (job_code,)
+                )
                 existing = dict_cur.fetchone()
                 dict_cur.close()
-                if existing and existing["outcome"] == "won_then_cancelled":
+                if existing and existing["outcome"] == "won_then_cancelled" and existing["wisdom_reason"]:
                     skipped += 1
                     continue
 
