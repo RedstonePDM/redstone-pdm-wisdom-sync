@@ -1274,12 +1274,13 @@ async def backfill_email_derived_outcomes(client, conn, cur):
             # time through no fault of the classification itself.
             dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             dict_cur.execute(
-                "SELECT id, outcome, wisdom_reason FROM quote_outcomes WHERE display_id = %s",
+                "SELECT id, outcome, wisdom_reason, pub_name FROM quote_outcomes WHERE display_id = %s",
                 (job_code,)
             )
             existing = dict_cur.fetchone()
             dict_cur.close()
-            if existing and existing["outcome"] == "won_then_cancelled" and existing["wisdom_reason"]:
+            if (existing and existing["outcome"] == "won_then_cancelled"
+                    and existing["wisdom_reason"] and existing["pub_name"]):
                 skipped += 1
                 continue
 
@@ -1291,28 +1292,49 @@ async def backfill_email_derived_outcomes(client, conn, cur):
             else:
                 blank += 1
 
+            # Pub name and trade type — separate lookup since
+            # scrape_outcome_reason only fetches the RFQSubmission
+            # sub-resource, not the parent job's own fields.
+            pub_name = ""
+            trade_type = ""
+            try:
+                job_detail = await client.get_job_detail(job_code)
+                pub_name = job_detail.get("PubName", "")
+                trade_type = job_detail.get("TradetypeText", "")
+            except Exception as detail_err:
+                log.warning(f"Could not fetch pub/trade for {job_code}: {detail_err}")
+
+            # Wisdom's own SubmissionDate usually comes back blank — the
+            # cancelled_date we already have from Dave's email is a real,
+            # known date, so use that as the fallback rather than let the
+            # reporting page default to 'today' (when this backfill ran).
+            reason_date = outcome_data.get("date", "") or cancelled_date
+
             cur.execute("""
                 INSERT INTO quote_outcomes
                     (job_id, display_id, outcome, wisdom_status, wisdom_reason,
-                     reason_heading, reason_date, t3_decision, detected_at,
+                     reason_heading, reason_date, pub_name, trade_type,
+                     t3_decision, detected_at,
                      source, email_approved_value, email_approved_date, email_cancelled_date)
-                VALUES (%s,%s,'won_then_cancelled','Job Cancelled',%s,%s,%s,%s,NOW(),
+                VALUES (%s,%s,'won_then_cancelled','Job Cancelled',%s,%s,%s,%s,%s,%s,NOW(),
                         'email_backfill',%s,%s,%s)
                 ON CONFLICT (display_id) DO UPDATE SET
                     outcome='won_then_cancelled',
                     wisdom_reason=EXCLUDED.wisdom_reason,
                     reason_heading=EXCLUDED.reason_heading,
                     reason_date=EXCLUDED.reason_date,
+                    pub_name=EXCLUDED.pub_name,
+                    trade_type=EXCLUDED.trade_type,
                     source='email_backfill',
                     email_approved_value=EXCLUDED.email_approved_value,
                     email_approved_date=EXCLUDED.email_approved_date,
                     email_cancelled_date=EXCLUDED.email_cancelled_date,
                     detected_at=NOW()
             """, (job_code, job_code, reason, outcome_data.get("heading", ""),
-                  outcome_data.get("date", ""), approved_date,
+                  reason_date, pub_name, trade_type, approved_date,
                   approved_value, approved_date, cancelled_date))
             conn.commit()
-            log.info(f"  Email backfill {i}/{len(EMAIL_BACKFILL_JOBS)}: {job_code} — reason: {reason or '(blank)'}")
+            log.info(f"  Email backfill {i}/{len(EMAIL_BACKFILL_JOBS)}: {job_code} ({pub_name or '?'}) — reason: {reason or '(blank)'}")
 
         except Exception as job_err:
             conn.rollback()
