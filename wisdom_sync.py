@@ -849,95 +849,34 @@ def run_sync():
 
 # ── Outcome Scraping Functions ────────────────────────────────────────────────
 
-async def scrape_outcome_reason(page, job_id, display_id):
-    """Navigate into a rejected/cancelled Wisdom job, click the Quote tab,
-    and extract the outcome reason, heading, and date.
+async def scrape_outcome_reason(client, job_id, display_id):
+    """Fetch the real cancellation/rejection reason for a quote via
+    Wisdom's own RFQSubmission API — a plain JSON call, exactly the same
+    reliable pattern used everywhere else in this file.
 
-    Takes an explicit `page` rather than reaching into a shared client
-    object. This matters: this function does a full page navigation
-    (page.goto), and the rest of the sync makes its API calls via
-    page.evaluate() against Wisdom's own SPA page. Navigating a page that
-    something else is mid-evaluate() on throws 'Execution context was
-    destroyed' — exactly the random crash seen a few times during this
-    project. Running this on its own dedicated, isolated page (opened and
-    closed by the caller) means it can never interfere with anything else
-    the sync is doing, however it fails."""
+    The previous version of this function navigated a browser page
+    (page.goto) into a hardcoded UI route and tried to click a tab —
+    that route turned out to be genuinely broken (Wisdom returns its own
+    'Business Server Page error' for it), which is why it never once
+    returned a real reason despite running successfully on 81 real jobs.
+
+    JobSet('{job_id}')/RFQSubmission returns SubmissionReason directly —
+    confirmed against a real job to match exactly what shows on Wisdom's
+    own detail screen ('Different Contractor Required' etc) — and this
+    works for BOTH pre-decision rejections and post-approval cancellations,
+    since it's the one place Wisdom stores 'why this didn't go ahead'
+    regardless of which stage it happened at."""
     try:
-        job_url = (
-            f"{WISDOM_BASE}/wisdom(bD1lbiZjPTEwMA==)/ContractorPortal#/jobDetail/{job_id}"
-        )
-        log.info(f"Scraping outcome for {display_id or job_id}")
-        await page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2500)
+        log.info(f"Fetching outcome reason for {display_id or job_id}")
+        url = f"{WISDOM_DATA}/JobSet('{job_id}')/RFQSubmission"
+        data = await client._browser_fetch(url)
+        rfq = data.get("d", {})
 
-        # Click the Quote tab — try multiple selectors
-        clicked = False
-        for selector in ["text=Quote", "a:has-text('Quote')", "[ng-click*='quote']"]:
-            try:
-                el = await page.wait_for_selector(selector, timeout=5000)
-                await el.click()
-                await page.wait_for_timeout(1500)
-                clicked = True
-                break
-            except Exception:
-                continue
+        reason = (rfq.get("SubmissionReason") or "").strip()
+        heading = (rfq.get("SubmissionAction") or "").strip()
+        reason_date = (rfq.get("SubmissionDate") or "").strip()
 
-        if not clicked:
-            # Dump what actually loaded, so we can fix the real problem
-            # instead of guessing at selectors blind a second time.
-            try:
-                actual_url = page.url
-                actual_title = await page.title()
-                body_preview = (await page.inner_text("body"))[:500]
-            except Exception as diag_err:
-                actual_url = f"(couldn't read: {diag_err})"
-                actual_title = "(unknown)"
-                body_preview = "(unknown)"
-            log.warning(
-                f"Could not click Quote tab for {job_id}. "
-                f"Landed on URL: {actual_url} | Title: {actual_title} | "
-                f"Body preview: {body_preview!r}"
-            )
-            return {}
-
-        # Extract all visible text and parse heading + reason
-        page_text = await page.inner_text("body")
-        lines = [l.strip() for l in page_text.split("\n") if l.strip()]
-
-        heading = ""
-        reason = ""
-        reason_date = ""
-
-        known_headings = [
-            "Reason for Withdrawing this Quote",
-            "Declined Quote",
-            "Cancellation Reason",
-            "Reason for Cancellation",
-            "Reason for Declining",
-        ]
-
-        for i, line in enumerate(lines):
-            # Detect heading
-            for h in known_headings:
-                if h.lower() in line.lower():
-                    heading = h
-                    break
-
-            # After heading or after "Reason" label, capture next non-nav line
-            if (line == "Reason" or (heading and line in [heading])) and i + 1 < len(lines):
-                nav_words = {"General", "Quote", "Notes", "KPIs", "Site Survey",
-                             "Material and Labour Costs", "Request Details"}
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    candidate = lines[j]
-                    if candidate and candidate not in nav_words and len(candidate) > 2:
-                        reason = candidate
-                        break
-
-            # Detect date line
-            if line == "Date" and i + 1 < len(lines):
-                reason_date = lines[i + 1]
-
-        log.info(f"  heading='{heading}' reason='{reason}' date='{reason_date}'")
+        log.info(f"  action='{heading}' reason='{reason}' date='{reason_date}'")
         return {"heading": heading, "reason": reason, "date": reason_date}
 
     except Exception as e:
@@ -1321,72 +1260,68 @@ async def backfill_email_derived_outcomes(client, conn, cur):
         ("50000292660", "2022-10-11", 350.00, "2022-09-30"),
     ]
 
-    detail_page = await client._context.new_page()
     found = 0
     blank = 0
     errored = 0
     skipped = 0
 
-    try:
-        for i, (job_code, cancelled_date, approved_value, approved_date) in enumerate(EMAIL_BACKFILL_JOBS, 1):
-            try:
-                # Only skip if this job already has a REAL reason recorded
-                # — not just because a row exists. Otherwise a re-run
-                # after fixing a scraping bug would skip every job again,
-                # including the ones that only got a blank reason last
-                # time through no fault of the classification itself.
-                dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-                dict_cur.execute(
-                    "SELECT id, outcome, wisdom_reason FROM quote_outcomes WHERE display_id = %s",
-                    (job_code,)
-                )
-                existing = dict_cur.fetchone()
-                dict_cur.close()
-                if existing and existing["outcome"] == "won_then_cancelled" and existing["wisdom_reason"]:
-                    skipped += 1
-                    continue
-
-                await asyncio.sleep(0.8)
-                outcome_data = await scrape_outcome_reason(detail_page, job_code, job_code)
-                reason = outcome_data.get("reason", "")
-                if reason:
-                    found += 1
-                else:
-                    blank += 1
-
-                cur.execute("""
-                    INSERT INTO quote_outcomes
-                        (job_id, display_id, outcome, wisdom_status, wisdom_reason,
-                         reason_heading, reason_date, t3_decision, detected_at,
-                         source, email_approved_value, email_approved_date, email_cancelled_date)
-                    VALUES (%s,%s,'won_then_cancelled','Job Cancelled',%s,%s,%s,%s,NOW(),
-                            'email_backfill',%s,%s,%s)
-                    ON CONFLICT (display_id) DO UPDATE SET
-                        outcome='won_then_cancelled',
-                        wisdom_reason=EXCLUDED.wisdom_reason,
-                        reason_heading=EXCLUDED.reason_heading,
-                        reason_date=EXCLUDED.reason_date,
-                        source='email_backfill',
-                        email_approved_value=EXCLUDED.email_approved_value,
-                        email_approved_date=EXCLUDED.email_approved_date,
-                        email_cancelled_date=EXCLUDED.email_cancelled_date,
-                        detected_at=NOW()
-                """, (job_code, job_code, reason, outcome_data.get("heading", ""),
-                      outcome_data.get("date", ""), approved_date,
-                      approved_value, approved_date, cancelled_date))
-                conn.commit()
-                log.info(f"  Email backfill {i}/{len(EMAIL_BACKFILL_JOBS)}: {job_code} — reason: {reason or '(blank)'}")
-
-            except Exception as job_err:
-                conn.rollback()
-                errored += 1
-                log.error(f"Email backfill failed for job {job_code}: {job_err}", exc_info=True)
+    for i, (job_code, cancelled_date, approved_value, approved_date) in enumerate(EMAIL_BACKFILL_JOBS, 1):
+        try:
+            # Only skip if this job already has a REAL reason recorded
+            # — not just because a row exists. Otherwise a re-run
+            # after fixing a scraping bug would skip every job again,
+            # including the ones that only got a blank reason last
+            # time through no fault of the classification itself.
+            dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            dict_cur.execute(
+                "SELECT id, outcome, wisdom_reason FROM quote_outcomes WHERE display_id = %s",
+                (job_code,)
+            )
+            existing = dict_cur.fetchone()
+            dict_cur.close()
+            if existing and existing["outcome"] == "won_then_cancelled" and existing["wisdom_reason"]:
+                skipped += 1
                 continue
 
-            if i % 20 == 0:
-                log.info(f"  Email backfill progress: {i} of {len(EMAIL_BACKFILL_JOBS)} processed...")
-    finally:
-        await detail_page.close()
+            await asyncio.sleep(0.5)
+            outcome_data = await scrape_outcome_reason(client, job_code, job_code)
+            reason = outcome_data.get("reason", "")
+            if reason:
+                found += 1
+            else:
+                blank += 1
+
+            cur.execute("""
+                INSERT INTO quote_outcomes
+                    (job_id, display_id, outcome, wisdom_status, wisdom_reason,
+                     reason_heading, reason_date, t3_decision, detected_at,
+                     source, email_approved_value, email_approved_date, email_cancelled_date)
+                VALUES (%s,%s,'won_then_cancelled','Job Cancelled',%s,%s,%s,%s,NOW(),
+                        'email_backfill',%s,%s,%s)
+                ON CONFLICT (display_id) DO UPDATE SET
+                    outcome='won_then_cancelled',
+                    wisdom_reason=EXCLUDED.wisdom_reason,
+                    reason_heading=EXCLUDED.reason_heading,
+                    reason_date=EXCLUDED.reason_date,
+                    source='email_backfill',
+                    email_approved_value=EXCLUDED.email_approved_value,
+                    email_approved_date=EXCLUDED.email_approved_date,
+                    email_cancelled_date=EXCLUDED.email_cancelled_date,
+                    detected_at=NOW()
+            """, (job_code, job_code, reason, outcome_data.get("heading", ""),
+                  outcome_data.get("date", ""), approved_date,
+                  approved_value, approved_date, cancelled_date))
+            conn.commit()
+            log.info(f"  Email backfill {i}/{len(EMAIL_BACKFILL_JOBS)}: {job_code} — reason: {reason or '(blank)'}")
+
+        except Exception as job_err:
+            conn.rollback()
+            errored += 1
+            log.error(f"Email backfill failed for job {job_code}: {job_err}", exc_info=True)
+            continue
+
+        if i % 20 == 0:
+            log.info(f"  Email backfill progress: {i} of {len(EMAIL_BACKFILL_JOBS)} processed...")
 
     log.info(
         f"Email-derived outcome backfill complete: {found} reasons found, "
@@ -1396,10 +1331,9 @@ async def backfill_email_derived_outcomes(client, conn, cur):
 
 async def scrape_outcomes_async(client, conn, cur):
     """Scrape rejected and cancelled jobs for outcome reasons, then record
-    them. Opens ONE isolated page (separate from client._page) for the
-    per-job detail lookups, used for every job in this run, closed at the
-    end — never touching the page the rest of the sync depends on."""
-    detail_page = await client._context.new_page()
+    them. The reason lookup is now a plain API call (see
+    scrape_outcome_reason), so no browser page navigation happens here at
+    all — nothing to isolate."""
     try:
         for tab, item, label in OUTCOME_TARGETS:
             log.info(f"Scraping outcomes: {label}")
@@ -1480,7 +1414,7 @@ async def scrape_outcomes_async(client, conn, cur):
                         outcome_type = "lost"  # RFQ Withdrawn — JDW went elsewhere
 
                     await asyncio.sleep(0.8)
-                    outcome_data = await scrape_outcome_reason(detail_page, job_id, display_id)
+                    outcome_data = await scrape_outcome_reason(client, job_id, display_id)
 
                     # Match to survey_form
                     cur.execute(
@@ -1528,8 +1462,8 @@ async def scrape_outcomes_async(client, conn, cur):
                     conn.rollback()
                     log.error(f"Failed to record outcome for job {job_summary.get('DisplayId') or job_summary.get('JobId')}: {job_err}", exc_info=True)
                     continue
-    finally:
-        await detail_page.close()
+    except Exception as e:
+        log.error(f"scrape_outcomes_async failed: {e}", exc_info=True)
 
 
 async def detect_wins_async(conn, cur):
