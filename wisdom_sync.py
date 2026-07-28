@@ -1413,7 +1413,7 @@ async def scrape_outcomes_async(client, conn, cur):
                     wisdom_status = job_summary.get("StatusText", item)
                     pub_name   = (job_summary.get("PubName") or
                                   job_summary.get("LocationText", ""))
-                    trade_type = job_summary.get("TradetypeText", "")
+                    trade_type = job_summary.get("TradetypeText") or job_summary.get("SubtradetypeText") or ""
 
                     if not job_id:
                         log.warning(f"Skipping a {label} job with no usable ID at all — raw fields: {list(job_summary.keys())}")
@@ -1461,28 +1461,54 @@ async def scrape_outcomes_async(client, conn, cur):
                     await asyncio.sleep(0.8)
                     outcome_data = await scrape_outcome_reason(client, job_id, display_id)
 
+                    # Match to survey_form first — if we surveyed this job
+                    # before it was rejected/cancelled, survey_forms already
+                    # has a reliable pub_name/trade_type captured at survey
+                    # time, no network call needed. Dict cursor deliberately
+                    # here — `cur` is a plain tuple cursor in this function
+                    # (see the comment above on existing_outcome), so a bare
+                    # cur.fetchone() would not support sf["pub_name"] access.
+                    dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    dict_cur.execute(
+                        """SELECT id, submitted_at, pub_name, trade_type FROM survey_forms
+                           WHERE job_id=%s OR job_id=%s
+                           ORDER BY submitted_at DESC LIMIT 1""",
+                        (job_id, display_id)
+                    )
+                    sf = dict_cur.fetchone()
+                    if sf:
+                        pub_name = pub_name or sf["pub_name"] or ""
+                        trade_type = trade_type or sf["trade_type"] or ""
+
+                    # Next, check the jobs table — reliable if this job was
+                    # still present there (i.e. hasn't been stale-deleted
+                    # since it left QUOTEREQUEST/QUOTE), also no network call.
+                    if not pub_name or not trade_type:
+                        dict_cur.execute(
+                            """SELECT pub_name, trade_type FROM jobs
+                               WHERE job_id=%s OR display_id=%s LIMIT 1""",
+                            (job_id, display_id)
+                        )
+                        jr = dict_cur.fetchone()
+                        if jr:
+                            pub_name = pub_name or jr["pub_name"] or ""
+                            trade_type = trade_type or jr["trade_type"] or ""
+                    dict_cur.close()
+
                     # Fall back to a direct job detail lookup for pub/trade
                     # if the list feed's own fields came back blank — the
                     # list feed uses inconsistent key names across the
                     # different Wisdom tabs, but the job detail endpoint is
                     # reliable (same one confirmed working for the email
-                    # backfill).
+                    # backfill). Last resort — slowest and most fragile of
+                    # the three fallbacks above.
                     if not pub_name or not trade_type:
                         try:
                             job_detail = await client.get_job_detail(job_id)
                             pub_name = pub_name or job_detail.get("PubName", "")
-                            trade_type = trade_type or job_detail.get("TradetypeText", "")
+                            trade_type = trade_type or job_detail.get("TradetypeText") or job_detail.get("SubtradetypeText") or ""
                         except Exception as detail_err:
                             log.warning(f"Could not fetch pub/trade detail for {job_id}: {detail_err}")
-
-                    # Match to survey_form
-                    cur.execute(
-                        """SELECT id, submitted_at FROM survey_forms
-                           WHERE job_id=%s OR job_id=%s
-                           ORDER BY submitted_at DESC LIMIT 1""",
-                        (job_id, display_id)
-                    )
-                    sf = cur.fetchone()
 
                     cur.execute(
                         """INSERT INTO quote_outcomes
