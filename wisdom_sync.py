@@ -1409,13 +1409,14 @@ async def scrape_outcomes_async(client, conn, cur):
                     # throw TypeError on a plain cursor. This bit it twice.
                     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                     dict_cur.execute(
-                        "SELECT id, outcome FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
+                        "SELECT id, outcome, pub_name, trade_type FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
                         (job_id, display_id)
                     )
                     existing = dict_cur.fetchone()
                     dict_cur.close()
                     existing_outcome = existing["outcome"] if existing else None
-                    if existing_outcome and existing_outcome != "won":
+                    existing_complete = bool(existing and existing["pub_name"] and existing["trade_type"])
+                    if existing_outcome and existing_outcome != "won" and existing_complete:
                         continue
 
                     # Categorise straight from the list feed's own status
@@ -1437,6 +1438,20 @@ async def scrape_outcomes_async(client, conn, cur):
 
                     await asyncio.sleep(0.8)
                     outcome_data = await scrape_outcome_reason(client, job_id, display_id)
+
+                    # Fall back to a direct job detail lookup for pub/trade
+                    # if the list feed's own fields came back blank — the
+                    # list feed uses inconsistent key names across the
+                    # different Wisdom tabs, but the job detail endpoint is
+                    # reliable (same one confirmed working for the email
+                    # backfill).
+                    if not pub_name or not trade_type:
+                        try:
+                            job_detail = await client.get_job_detail(job_id)
+                            pub_name = pub_name or job_detail.get("PubName", "")
+                            trade_type = trade_type or job_detail.get("TradetypeText", "")
+                        except Exception as detail_err:
+                            log.warning(f"Could not fetch pub/trade detail for {job_id}: {detail_err}")
 
                     # Match to survey_form
                     cur.execute(
