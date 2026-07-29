@@ -395,8 +395,16 @@ def upsert_job(cur, job_data: dict, tab: str, sub_tab: str,
     postcode = (job_data.get("PostCode") or job_data.get("_postcode") or "").strip()
     now = datetime.now(timezone.utc)
 
-    cur.execute("SELECT job_id, status FROM jobs WHERE job_id = %s", (job_id,))
-    existing = cur.fetchone()
+    # Dict cursor deliberately here — `cur` is the plain tuple cursor
+    # passed all the way from run_sync_async (see the pattern established
+    # elsewhere in this file). existing['status'] on a plain tuple row
+    # throws TypeError, uncaught, which aborts sync_target_async's entire
+    # per-job loop for this target and rolls back everything synced so far
+    # this cycle the moment it hits the first job that already existed.
+    dict_cur = cur.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    dict_cur.execute("SELECT job_id, status FROM jobs WHERE job_id = %s", (job_id,))
+    existing = dict_cur.fetchone()
+    dict_cur.close()
     previous_status = existing["status"] if existing else None
 
     row = {
@@ -1419,6 +1427,22 @@ async def scrape_outcomes_async(client, conn, cur):
                         log.warning(f"Skipping a {label} job with no usable ID at all — raw fields: {list(job_summary.keys())}")
                         continue
 
+                    # Resolve the canonical job_id via display_id through the
+                    # jobs table. job_id above is a best-effort guess from
+                    # this feed's own fields, but upsert_job (which actually
+                    # created the jobs/survey_forms rows we need to link
+                    # back to) uses a DIFFERENT fallback order (JobId ->
+                    # DisplayId, no WISDOMId step) — so on feeds missing
+                    # JobId, this function's guess and the original record's
+                    # real job_id can be two different values. display_id
+                    # is the one field both paths agree on, so use it to
+                    # find the actual job_id that was used at creation time.
+                    canon_job_id = job_id
+                    cur.execute("SELECT job_id FROM jobs WHERE display_id=%s LIMIT 1", (display_id,))
+                    _jr = cur.fetchone()
+                    if _jr:
+                        canon_job_id = _jr[0]
+
                     # Skip only if we've already recorded a TERMINAL outcome
                     # for this job — a 'won' outcome is deliberately NOT
                     # terminal, since a won job can still be cancelled
@@ -1432,7 +1456,7 @@ async def scrape_outcomes_async(client, conn, cur):
                     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                     dict_cur.execute(
                         "SELECT id, outcome, pub_name, trade_type FROM quote_outcomes WHERE job_id=%s OR display_id=%s",
-                        (job_id, display_id)
+                        (canon_job_id, display_id)
                     )
                     existing = dict_cur.fetchone()
                     dict_cur.close()
@@ -1471,9 +1495,9 @@ async def scrape_outcomes_async(client, conn, cur):
                     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                     dict_cur.execute(
                         """SELECT id, submitted_at, pub_name, trade_type FROM survey_forms
-                           WHERE job_id=%s OR job_id=%s
+                           WHERE job_id=%s
                            ORDER BY submitted_at DESC LIMIT 1""",
-                        (job_id, display_id)
+                        (canon_job_id,)
                     )
                     sf = dict_cur.fetchone()
                     if sf:
@@ -1487,7 +1511,7 @@ async def scrape_outcomes_async(client, conn, cur):
                         dict_cur.execute(
                             """SELECT pub_name, trade_type FROM jobs
                                WHERE job_id=%s OR display_id=%s LIMIT 1""",
-                            (job_id, display_id)
+                            (canon_job_id, display_id)
                         )
                         jr = dict_cur.fetchone()
                         if jr:
@@ -1523,7 +1547,7 @@ async def scrape_outcomes_async(client, conn, cur):
                                reason_heading=EXCLUDED.reason_heading,
                                reason_date=EXCLUDED.reason_date,
                                detected_at=NOW()""",
-                        (job_id, display_id, sf["id"] if sf else None,
+                        (canon_job_id, display_id, sf["id"] if sf else None,
                          outcome_type, wisdom_status,
                          outcome_data.get("reason", ""),
                          outcome_data.get("heading", ""),
@@ -1554,7 +1578,16 @@ async def scrape_outcomes_async(client, conn, cur):
 async def detect_wins_async(conn, cur):
     """Auto-detect wins: survey job appearing in QUOTE tab means JDW approved it."""
     try:
-        cur.execute(
+        # Dict cursor deliberately here — the `cur` passed into this
+        # function from run_sync_async is a plain tuple cursor
+        # (conn.cursor() with no cursor_factory), so w["id"]/w["job_id"]
+        # etc. below would throw TypeError on every row. That's exactly
+        # what was happening — silently, since the caller wraps this whole
+        # function in a try/except that just logs and moves on. This is
+        # the actual reason zero jobs have ever been recorded as a plain
+        # 'won' outcome, despite genuinely-won jobs sitting in Wisdom.
+        dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        dict_cur.execute(
             """SELECT sf.id, sf.job_id, j.display_id, j.pub_name, j.trade_type,
                       j.date_released
                FROM survey_forms sf
@@ -1562,7 +1595,8 @@ async def detect_wins_async(conn, cur):
                WHERE j.tab='QUOTE'
                AND sf.status NOT IN ('won','cancelled')"""
         )
-        wins = cur.fetchall()
+        wins = dict_cur.fetchall()
+        dict_cur.close()
         for w in wins:
             cur.execute(
                 """UPDATE survey_forms SET status='won', outcome='won',
